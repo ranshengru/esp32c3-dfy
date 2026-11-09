@@ -2,9 +2,11 @@
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #include "net.h"
 #include "portal.h"
+#include "prompts.h"
 #include "quotes.h"
 #include "sonar.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_rom_crc.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -75,10 +78,16 @@ static int g_drinks_today;
 static int g_drink_day = -1;
 static int g_remind_kind;
 static int64_t g_phrase_until_us;
+// g_phrase markers: show the balance card instead of a bubble.
+#define PHRASE_BALANCE "\001bal"
+#define PHRASE_BALANCE_WAIT "\001wait"
 static int64_t g_remind_until_us;
 static int64_t g_last_drink_us;
 static int64_t g_last_move_us;
 static int64_t g_next_weather_us;
+static int64_t g_weather_ok_us; // last good Open-Meteo fetch (0 = none yet)
+#define WEATHER_EVERY_US (30LL * 60 * 1000000LL)
+#define WEATHER_RETRY_US (2LL * 60 * 1000000LL)
 static int64_t g_arm_us;
 static bool g_arm_double;
 static bool g_refill_pending;
@@ -112,6 +121,7 @@ static uint32_t g_anim_seq;
 static int g_wcode = -1;
 static int g_temp_c;
 static bool g_balance_bubble;
+static char g_bal_hhmm[8]; // local time of the last good balance query
 
 static uint16_t g_wish_used; // shuffle bag over BIRTHDAY_WISHES
 static uint32_t g_fx_seq;      // fireworks
@@ -423,12 +433,17 @@ static bool utf8_next(const unsigned char **text, uint32_t *codepoint)
 
 // ---- sentence pool ---------------------------------------------------------
 // 20 built-in seed lines (quotes.h) plus up to POOL_GEN_MAX lines generated in
-// rare DeepSeek batches. Shuffle bag: a line is not repeated until every
-// eligible line has been shown once this round, and never one of the last
-// POOL_RECENT lines. Lines shown POOL_RETIRE times retire (generated ones are
-// deleted to make room). When fewer than 20% of active lines are unshown this
-// round, one batch refill is queued (still bound by the 12 h spacing and the
-// 4-calls-a-day cap in llm_take_slot). Everything persists in one NVS blob.
+// rare DeepSeek batches. Every line has a bucket (time of day x condition);
+// at display time only lines matching the current time and weather are
+// eligible (context_now_locked), and lines made for exactly this moment are
+// weighted up. Shuffle bag: a line is not repeated until every eligible line
+// has been shown once this round, and never one of the last POOL_RECENT lines.
+// Lines shown POOL_RETIRE times retire (generated ones are deleted to make
+// room). When fewer than 20% of active lines are unshown this round, one batch
+// refill is queued (still bound by the 12 h spacing and the 4-calls-a-day cap
+// in llm_take_slot). Everything persists in one CRC-checked NVS blob; a blob
+// that fails the size/version/CRC check, or any single line that fails
+// validation, is dropped and the built-in seeds carry on.
 
 enum {
     POOL_GEN_MAX = 40,
@@ -438,11 +453,14 @@ enum {
     POOL_LOW_PCT = 20,
     POOL_BATCH = 20,
     POOL_RETIRED = 255,
-    POOL_VERSION = 1,
+    POOL_VERSION = 2,
 };
 
+#define FILL_TEMP_WORST "-10°C"
+#define FILL_WEATHER_WORST "雷阵雨"
+
 typedef struct {
-    uint8_t tag;
+    uint8_t tag; // time bucket << 4 | condition (quotes.h T_* / C_*)
     uint8_t shows;
     uint8_t used;
     uint8_t pad;
@@ -452,39 +470,219 @@ typedef struct {
 typedef struct {
     uint8_t version;
     uint8_t builtin_count;
+    uint16_t refills;
+    uint32_t seed_hash;
     uint8_t bshows[PET_QUOTE_COUNT];
     uint8_t bused[PET_QUOTE_COUNT];
     GenLine gen[POOL_GEN_MAX];
+    uint32_t crc; // CRC32 of every byte before this field
 } PoolStore;
 
+// v0.5 pre-release layout (single tag per line), migrated on load.
+typedef struct {
+    uint8_t version;
+    uint8_t builtin_count;
+    uint8_t bshows[20];
+    uint8_t bused[20];
+    GenLine gen[POOL_GEN_MAX];
+} PoolStoreV1;
+
 static PoolStore g_pool;
+static int g_boots;
+static const char *g_reset_name = "?";
 static int g_recent[POOL_RECENT] = {-1, -1, -1, -1, -1, -1};
 static int g_recent_pos;
 static bool g_pool_dirty;
 static int64_t g_pool_saved_us;
-static int g_pool_refills;
 static bool g_refill_force;
+static char g_pool_boot[48] = "-";
+
+static const char *weather_name(int code);
+static bool pool_line_ok(char *text);
+
+static void utf8_put(char *out, int *used, int size, uint32_t c)
+{
+    int bytes = c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+    if (*used + bytes >= size)
+        return;
+    if (c < 0x80) {
+        out[(*used)++] = (char)c;
+    } else if (c < 0x800) {
+        out[(*used)++] = (char)(0xc0 | (c >> 6));
+        out[(*used)++] = (char)(0x80 | (c & 0x3f));
+    } else {
+        out[(*used)++] = (char)(0xe0 | (c >> 12));
+        out[(*used)++] = (char)(0x80 | ((c >> 6) & 0x3f));
+        out[(*used)++] = (char)(0x80 | (c & 0x3f));
+    }
+}
+
+static uint32_t seed_hash(void)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < PET_QUOTE_COUNT; ++i) {
+        h = (h ^ PET_QUOTES[i].time) * 16777619u;
+        h = (h ^ PET_QUOTES[i].cond) * 16777619u;
+        for (const char *p = PET_QUOTES[i].text; *p; ++p)
+            h = (h ^ (uint8_t)*p) * 16777619u;
+    }
+    return h;
+}
+
+static uint32_t pool_crc(const PoolStore *p)
+{
+    return esp_rom_crc32_le(0, (const uint8_t *)p, offsetof(PoolStore, crc));
+}
+
+// Replaces {temp} / {weather}; false if a placeholder is unknown.
+static bool fill_line(char *out, size_t size, const char *text, const char *temp, const char *weather)
+{
+    size_t used = 0;
+    out[0] = 0;
+    while (*text) {
+        const char *put = 0;
+        size_t skip = 1;
+        if (!strncmp(text, "{temp}", 6)) {
+            put = temp;
+            skip = 6;
+        } else if (!strncmp(text, "{weather}", 9)) {
+            put = weather;
+            skip = 9;
+        } else if (*text == '{' || *text == '}') {
+            return false;
+        }
+        if (put) {
+            size_t n = strlen(put);
+            if (used + n >= size)
+                return false;
+            memcpy(out + used, put, n);
+            used += n;
+        } else {
+            if (used + 1 >= size)
+                return false;
+            out[used++] = *text;
+        }
+        text += skip;
+    }
+    out[used] = 0;
+    return true;
+}
+
+static bool has_placeholder(const char *text)
+{
+    return strstr(text, "{temp}") || strstr(text, "{weather}");
+}
+
+// Checks every field of a loaded blob; returns how many lines were dropped.
+static int pool_validate(PoolStore *p)
+{
+    int dropped = 0;
+    for (int i = 0; i < PET_QUOTE_COUNT; ++i) {
+        if (p->bshows[i] > POOL_RETIRE && p->bshows[i] != POOL_RETIRED)
+            p->bshows[i] = 0;
+        if (p->bused[i] > 1)
+            p->bused[i] = 0;
+    }
+    for (int i = 0; i < POOL_GEN_MAX; ++i) {
+        GenLine *g = &p->gen[i];
+        if (!g->text[0]) {
+            memset(g, 0, sizeof(*g));
+            continue;
+        }
+        bool ok = memchr(g->text, 0, POOL_TEXT) != 0 && (g->tag >> 4) < T_COUNT && (g->tag & 15) < C_COUNT &&
+                  g->shows < POOL_RETIRE && g->used <= 1;
+        if (ok) {
+            char copy[POOL_TEXT];
+            strcpy(copy, g->text);
+            ok = pool_line_ok(copy) && !strcmp(copy, g->text);
+        }
+        if (!ok) {
+            memset(g, 0, sizeof(*g));
+            ++dropped;
+        }
+    }
+    return dropped;
+}
+
+// Decodes a raw NVS blob into *out (always leaves a usable pool) and writes a
+// short status ("ok", "new", "migrated v1", "corrupt crc"...) into status.
+static void pool_decode(const void *blob, size_t length, PoolStore *out, char *status, size_t status_len)
+{
+    memset(out, 0, sizeof(*out));
+    int dropped = 0;
+    if (!blob || !length) {
+        snprintf(status, status_len, "new");
+    } else if (length == sizeof(PoolStore) && ((const PoolStore *)blob)->version == POOL_VERSION) {
+        memcpy(out, blob, sizeof(*out));
+        if (pool_crc(out) != out->crc) {
+            memset(out, 0, sizeof(*out));
+            snprintf(status, status_len, "corrupt crc, seeds only");
+        } else {
+            dropped = pool_validate(out);
+            snprintf(status, status_len, "ok");
+        }
+    } else if (length == sizeof(PoolStoreV1) && ((const PoolStoreV1 *)blob)->version == 1) {
+        static const uint8_t map[8] = {T_ANY << 4 | C_GENERAL,     T_MORNING << 4 | C_GENERAL,
+                                       T_NOON << 4 | C_GENERAL,    T_EVENING << 4 | C_GENERAL,
+                                       T_LATE << 4 | C_GENERAL,    T_ANY << 4 | C_RAIN,
+                                       T_ANY << 4 | C_HOT,         T_ANY << 4 | C_COLD};
+        const PoolStoreV1 *old = blob;
+        memcpy(out->gen, old->gen, sizeof(out->gen));
+        for (int i = 0; i < POOL_GEN_MAX; ++i)
+            out->gen[i].tag = out->gen[i].tag < 8 ? map[out->gen[i].tag] : 0xff;
+        dropped = pool_validate(out);
+        snprintf(status, status_len, "migrated v1");
+    } else {
+        snprintf(status, status_len, "corrupt size %u, seeds only", (unsigned)length);
+    }
+    if (out->builtin_count != PET_QUOTE_COUNT || out->seed_hash != seed_hash()) {
+        // Seed list changed in firmware: restart its counters, keep generated lines.
+        memset(out->bshows, 0, sizeof(out->bshows));
+        memset(out->bused, 0, sizeof(out->bused));
+    }
+    out->version = POOL_VERSION;
+    out->builtin_count = PET_QUOTE_COUNT;
+    out->seed_hash = seed_hash();
+    if (dropped) {
+        size_t n = strlen(status);
+        snprintf(status + n, status_len - n, ", dropped %d bad line(s)", dropped);
+    }
+}
+
+// Reads blob `key` from NVS and decodes it.
+static void pool_read_key(const char *key, PoolStore *out, char *status, size_t status_len)
+{
+    void *raw = 0;
+    size_t length = 0;
+    bool bad = false;
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS, NVS_READONLY, &handle) == ESP_OK) {
+        if (nvs_get_blob(handle, key, 0, &length) == ESP_OK && length) {
+            raw = length <= sizeof(PoolStore) + 64 ? malloc(length) : 0;
+            if (!raw || nvs_get_blob(handle, key, raw, &length) != ESP_OK) {
+                free(raw);
+                raw = 0;
+                bad = true;
+            }
+        } else {
+            length = 0;
+        }
+        nvs_close(handle);
+    }
+    pool_decode(raw, raw ? length : 0, out, status, status_len);
+    if (bad)
+        snprintf(status, status_len, "unreadable (%u bytes), seeds only", (unsigned)length);
+    free(raw);
+}
+
+static void pool_save(void);
 
 static void pool_load(void)
 {
-    memset(&g_pool, 0, sizeof(g_pool));
-    nvs_handle_t handle;
-    if (nvs_open(NVS_NS, NVS_READONLY, &handle) == ESP_OK) {
-        size_t length = sizeof(g_pool);
-        if (nvs_get_blob(handle, "pool", &g_pool, &length) != ESP_OK || length != sizeof(g_pool) ||
-            g_pool.version != POOL_VERSION)
-            memset(&g_pool, 0, sizeof(g_pool));
-        nvs_close(handle);
-    }
-    if (g_pool.builtin_count != PET_QUOTE_COUNT) {
-        // Seed list changed in firmware: restart its counters, keep generated lines.
-        memset(g_pool.bshows, 0, sizeof(g_pool.bshows));
-        memset(g_pool.bused, 0, sizeof(g_pool.bused));
-    }
-    g_pool.version = POOL_VERSION;
-    g_pool.builtin_count = PET_QUOTE_COUNT;
-    for (int i = 0; i < POOL_GEN_MAX; ++i)
-        g_pool.gen[i].text[POOL_TEXT - 1] = 0;
+    pool_read_key("pool", &g_pool, g_pool_boot, sizeof(g_pool_boot));
+    printf("POOL boot: %s\n", g_pool_boot);
+    if (strcmp(g_pool_boot, "ok"))
+        pool_save(); // store the repaired / migrated / fresh pool right away
 }
 
 static void pool_save(void)
@@ -493,19 +691,122 @@ static void pool_save(void)
     if (nvs_open(NVS_NS, NVS_READWRITE, &handle) != ESP_OK)
         return;
     xSemaphoreTake(mu, portMAX_DELAY);
+    g_pool.crc = pool_crc(&g_pool);
     esp_err_t err = nvs_set_blob(handle, "pool", &g_pool, sizeof(g_pool));
     g_pool_dirty = false;
     xSemaphoreGive(mu);
     if (err == ESP_OK)
-        nvs_commit(handle);
+        err = nvs_commit(handle);
     nvs_close(handle);
+    if (err != ESP_OK)
+        printf("POOL save failed: %s\n", esp_err_to_name(err));
     g_pool_saved_us = esp_timer_get_time();
 }
 
-// Counters change on every sweep; write them at most every 2 minutes.
+static int pool_gen_count(const PoolStore *p)
+{
+    int n = 0;
+    for (int i = 0; i < POOL_GEN_MAX; ++i)
+        n += p->gen[i].text[0] != 0;
+    return n;
+}
+
+static bool pool_write_key(const char *key, const void *data, size_t length)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &handle) != ESP_OK)
+        return false;
+    esp_err_t err = nvs_set_blob(handle, key, data, length);
+    if (err == ESP_OK)
+        err = nvs_commit(handle);
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+// POOL SELFTEST: runs the boot loader on deliberately damaged copies of the
+// pool written to a scratch NVS key ("pooltst"); the real "pool" is untouched.
+static void pool_selftest(void)
+{
+    PoolStore *a = malloc(sizeof(PoolStore));
+    PoolStore *b = malloc(sizeof(PoolStore));
+    if (!a || !b) {
+        free(a);
+        free(b);
+        printf("POOL SELFTEST no memory\n");
+        return;
+    }
+    char st[64];
+    int pass = 0, total = 0;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    memcpy(a, &g_pool, sizeof(*a));
+    xSemaphoreGive(mu);
+    a->crc = pool_crc(a);
+    int gen0 = pool_gen_count(a);
+#define POOL_CHECK(name, cond)                                                                       \
+    do {                                                                                             \
+        bool ok_ = (cond);                                                                           \
+        ++total;                                                                                     \
+        pass += ok_;                                                                                 \
+        printf("POOL SELFTEST %-22s %s -> %s, generated %d\n", name, ok_ ? "PASS" : "FAIL", st,      \
+               pool_gen_count(b));                                                                   \
+    } while (0)
+
+    pool_write_key("pooltst", a, sizeof(*a));
+    pool_read_key("pooltst", b, st, sizeof(st));
+    POOL_CHECK("intact copy", !strcmp(st, "ok") && pool_gen_count(b) == gen0 && !memcmp(b->bshows, a->bshows, sizeof(a->bshows)));
+
+    ((uint8_t *)a)[offsetof(PoolStore, gen) + 9] ^= 0x5a;
+    pool_write_key("pooltst", a, sizeof(*a));
+    pool_read_key("pooltst", b, st, sizeof(st));
+    POOL_CHECK("flipped byte", !strncmp(st, "corrupt crc", 11) && pool_gen_count(b) == 0);
+    ((uint8_t *)a)[offsetof(PoolStore, gen) + 9] ^= 0x5a;
+
+    pool_write_key("pooltst", a, sizeof(*a) - 100);
+    pool_read_key("pooltst", b, st, sizeof(st));
+    POOL_CHECK("truncated blob", !strncmp(st, "corrupt size", 12) && pool_gen_count(b) == 0);
+
+    uint8_t junk[200];
+    esp_fill_random(junk, sizeof(junk));
+    pool_write_key("pooltst", junk, sizeof(junk));
+    pool_read_key("pooltst", b, st, sizeof(st));
+    POOL_CHECK("random bytes", !strncmp(st, "corrupt size", 12) && pool_gen_count(b) == 0);
+
+    memset(a, 0, sizeof(*a));
+    a->version = POOL_VERSION;
+    a->builtin_count = PET_QUOTE_COUNT;
+    a->seed_hash = seed_hash();
+    a->bshows[0] = 77; // impossible count -> reset to 0
+    snprintf(a->gen[0].text, POOL_TEXT, "%s", "本鱼在这里，陪着你呢。");
+    snprintf(a->gen[1].text, POOL_TEXT, "%s", "本鱼在这里，陪着你哦。");
+    a->gen[1].tag = 0xff; // unknown bucket
+    memset(a->gen[2].text, 'A', POOL_TEXT); // no terminator
+    snprintf(a->gen[3].text, POOL_TEXT, "%s", "一二三四五六七八九十一二三四五六七八九十");
+    a->crc = pool_crc(a);
+    pool_write_key("pooltst", a, sizeof(*a));
+    pool_read_key("pooltst", b, st, sizeof(st));
+    POOL_CHECK("bad lines, good crc", strstr(st, "dropped 3") && pool_gen_count(b) == 1 && b->bshows[0] == 0);
+
+    pool_read_key("pooltst_none", b, st, sizeof(st));
+    POOL_CHECK("missing blob", !strcmp(st, "new") && pool_gen_count(b) == 0);
+#undef POOL_CHECK
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_erase_key(handle, "pooltst");
+        nvs_commit(handle);
+        nvs_close(handle);
+    }
+    free(a);
+    free(b);
+    printf("POOL SELFTEST %s (%d/%d); live pool untouched\n", pass == total ? "PASS" : "FAIL", pass, total);
+}
+
+// Counters change on every sweep; write them 10 s after the last change (a few
+// dozen 3 KB writes a day is far inside the NVS wear budget), so a power cut
+// loses at most the last few seconds of show counts.
+static int64_t g_pool_dirty_us;
 static void pool_flush_if_due(void)
 {
-    if (g_pool_dirty && esp_timer_get_time() - g_pool_saved_us > 120 * 1000000LL)
+    if (g_pool_dirty && esp_timer_get_time() - g_pool_dirty_us > 10 * 1000000LL)
         pool_save();
 }
 
@@ -521,9 +822,14 @@ static const char *pool_text(int id)
     return id < PET_QUOTE_COUNT ? PET_QUOTES[id].text : g_pool.gen[id - PET_QUOTE_COUNT].text;
 }
 
-static int pool_tag(int id)
+static int pool_time(int id)
 {
-    return id < PET_QUOTE_COUNT ? PET_QUOTES[id].tag : g_pool.gen[id - PET_QUOTE_COUNT].tag;
+    return id < PET_QUOTE_COUNT ? PET_QUOTES[id].time : g_pool.gen[id - PET_QUOTE_COUNT].tag >> 4;
+}
+
+static int pool_cond(int id)
+{
+    return id < PET_QUOTE_COUNT ? PET_QUOTES[id].cond : g_pool.gen[id - PET_QUOTE_COUNT].tag & 15;
 }
 
 static uint8_t *pool_used(int id)
@@ -545,31 +851,89 @@ static void pool_counts_locked(int *active, int *unused, int *generated)
     }
 }
 
-static int time_tag(int hour)
+static int time_bucket(int hour)
 {
     if (hour >= 5 && hour <= 10)
-        return Q_MORNING;
+        return T_MORNING;
     if (hour >= 11 && hour <= 13)
-        return Q_NOON;
-    if (hour >= 17 && hour <= 21)
-        return Q_EVENING;
-    if (hour >= 22 || hour <= 4)
-        return Q_NIGHT;
-    return Q_ANY;
+        return T_NOON;
+    if (hour >= 14 && hour <= 16)
+        return T_AFTERNOON;
+    if (hour >= 17 && hour <= 19)
+        return T_EVENING;
+    if (hour >= 20 && hour <= 22)
+        return T_NIGHT;
+    return T_LATE;
 }
 
-static int weather_tag_locked(void)
+// The moment a line is displayed: time bucket (T_ANY if the clock is not set
+// yet), a bit mask of the conditions that hold now (1 << C_*), and the
+// {temp}/{weather} values (empty while weather is unknown).
+typedef struct {
+    int bucket;
+    unsigned conds;
+    bool weather;
+    char temp[12];
+    char wname[16];
+} PoolCtx;
+
+static void context_now_locked(PoolCtx *ctx)
 {
-    if (g_wcode < 0)
-        return Q_ANY;
-    bool snow = (g_wcode >= 71 && g_wcode <= 77) || g_wcode == 85 || g_wcode == 86;
-    if (g_wcode >= 51 && !snow)
-        return Q_RAIN;
-    if (g_temp_c >= 30)
-        return Q_HOT;
-    if (g_temp_c <= 8)
-        return Q_COLD;
-    return Q_ANY;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->bucket = T_ANY;
+    if (time_ready()) {
+        time_t wall = time(NULL);
+        struct tm local;
+        localtime_r(&wall, &local);
+        ctx->bucket = time_bucket(local.tm_hour);
+        if (local.tm_wday == 0 || local.tm_wday == 6)
+            ctx->conds |= 1u << C_WEEKEND;
+    }
+    if (g_wcode >= 0) {
+        bool snow = (g_wcode >= 71 && g_wcode <= 77) || g_wcode == 85 || g_wcode == 86;
+        if (g_wcode >= 51 && !snow)
+            ctx->conds |= 1u << C_RAIN;
+        if (g_wcode <= 1)
+            ctx->conds |= 1u << C_CLEAR;
+        if (g_temp_c >= 30)
+            ctx->conds |= 1u << C_HOT;
+        if (g_temp_c <= 10)
+            ctx->conds |= 1u << C_COLD;
+        ctx->weather = true;
+        snprintf(ctx->temp, sizeof(ctx->temp), "%d°C", g_temp_c);
+        snprintf(ctx->wname, sizeof(ctx->wname), "%s", weather_name(g_wcode));
+    }
+}
+
+static void context_text(const PoolCtx *ctx, char *out, size_t size)
+{
+    int used = snprintf(out, size, "%s", ctx->bucket == T_ANY ? "time-unknown" : T_NAMES[ctx->bucket]);
+    for (int c = 1; c < C_COUNT && used < (int)size; ++c)
+        if (ctx->conds & (1u << c))
+            used += snprintf(out + used, size - used, " %s", C_NAMES[c]);
+    if (!ctx->conds && used < (int)size)
+        snprintf(out + used, size - used, " general");
+}
+
+// 0 = not eligible now; otherwise the pick weight: 1 for an any/general line,
+// +2 for a line made for this time bucket, +2 for one made for this weather.
+static int pool_weight(int id, const PoolCtx *ctx, char *filled, size_t size)
+{
+    if (!pool_active(id))
+        return 0;
+    int t = pool_time(id), c = pool_cond(id);
+    if (t != T_ANY && t != ctx->bucket)
+        return 0;
+    if (c != C_GENERAL && !(ctx->conds & (1u << c)))
+        return 0;
+    const char *text = pool_text(id);
+    if (has_placeholder(text)) {
+        if (!ctx->weather || !fill_line(filled, size, text, ctx->temp, ctx->wname) || !display_bubble_fits(filled))
+            return 0;
+    } else {
+        snprintf(filled, size, "%s", text);
+    }
+    return 1 + (t != T_ANY ? 2 : 0) + (c != C_GENERAL ? 2 : 0);
 }
 
 static bool pool_recent(int id)
@@ -580,21 +944,19 @@ static bool pool_recent(int id)
     return false;
 }
 
-static bool pool_eligible(int id, int ttag, int wtag)
+static int pool_choose_locked(const PoolCtx *ctx, bool need_unused, bool allow_recent)
 {
-    if (!pool_active(id))
-        return false;
-    int tag = pool_tag(id);
-    return tag == Q_ANY || tag == ttag || tag == wtag;
-}
-
-static int pool_choose_locked(int ttag, int wtag, bool need_unused)
-{
-    int chosen = -1, seen = 0;
+    char filled[POOL_TEXT + 16];
+    int chosen = -1;
+    uint32_t total = 0;
     for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id) {
-        if (!pool_eligible(id, ttag, wtag) || pool_recent(id) || (need_unused && *pool_used(id)))
+        if ((!allow_recent && pool_recent(id)) || (need_unused && *pool_used(id)))
             continue;
-        if (esp_random() % (uint32_t)++seen == 0)
+        int w = pool_weight(id, ctx, filled, sizeof(filled));
+        if (!w)
+            continue;
+        total += (uint32_t)w;
+        if (esp_random() % total < (uint32_t)w)
             chosen = id;
     }
     return chosen;
@@ -602,34 +964,35 @@ static int pool_choose_locked(int ttag, int wtag, bool need_unused)
 
 static void show_phrase_locked(void)
 {
-    int hour = -1;
-    if (time_ready()) {
-        time_t wall = time(NULL);
-        struct tm local;
-        localtime_r(&wall, &local);
-        hour = local.tm_hour;
-    }
-    int ttag = hour < 0 ? Q_ANY : time_tag(hour);
-    int wtag = weather_tag_locked();
-    int id = pool_choose_locked(ttag, wtag, true);
+    PoolCtx ctx;
+    context_now_locked(&ctx);
+    int id = pool_choose_locked(&ctx, true, false);
     if (id < 0) {
         // Every eligible line was shown this round: start a new round for them.
+        char filled[POOL_TEXT + 16];
         for (int k = 0; k < PET_QUOTE_COUNT + POOL_GEN_MAX; ++k)
-            if (pool_eligible(k, ttag, wtag))
+            if (pool_weight(k, &ctx, filled, sizeof(filled)))
                 *pool_used(k) = 0;
-        id = pool_choose_locked(ttag, wtag, true);
+        id = pool_choose_locked(&ctx, true, false);
     }
     if (id < 0)
-        id = pool_choose_locked(ttag, wtag, false);
+        id = pool_choose_locked(&ctx, false, false);
+    if (id < 0)
+        id = pool_choose_locked(&ctx, false, true);
     if (id < 0) {
-        // Pool nearly empty (everything retired): bring the seed lines back.
+        // Nothing fits right now (everything retired): bring the seed lines back.
         memset(g_pool.bshows, 0, sizeof(g_pool.bshows));
         memset(g_pool.bused, 0, sizeof(g_pool.bused));
-        id = pool_choose_locked(Q_ANY, Q_ANY, false);
+        id = pool_choose_locked(&ctx, false, true);
     }
-    if (id < 0)
-        id = 0;
-    snprintf(g_phrase, sizeof(g_phrase), "%s", pool_text(id));
+    char filled[POOL_TEXT + 16];
+    if (id < 0 || !pool_weight(id, &ctx, filled, sizeof(filled))) {
+        for (id = 0; id < PET_QUOTE_COUNT - 1; ++id)
+            if (PET_QUOTES[id].time == T_ANY && PET_QUOTES[id].cond == C_GENERAL && !has_placeholder(PET_QUOTES[id].text))
+                break;
+        snprintf(filled, sizeof(filled), "%s", PET_QUOTES[id].text);
+    }
+    snprintf(g_phrase, sizeof(g_phrase), "%s", filled);
     g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
     *pool_used(id) = 1;
     g_recent[g_recent_pos] = id;
@@ -637,7 +1000,10 @@ static void show_phrase_locked(void)
     uint8_t *shows = id < PET_QUOTE_COUNT ? &g_pool.bshows[id] : &g_pool.gen[id - PET_QUOTE_COUNT].shows;
     if (*shows < POOL_RETIRE)
         ++*shows;
-    printf("QUOTE #%d %s shows %d tag %d\n", id, g_phrase, *shows, pool_tag(id));
+    char now[64];
+    context_text(&ctx, now, sizeof(now));
+    printf("QUOTE #%d %s shows %d [%s/%s] now %s\n", id, g_phrase, *shows, T_NAMES[pool_time(id)],
+           C_NAMES[pool_cond(id)], now);
     if (*shows >= POOL_RETIRE) {
         if (id < PET_QUOTE_COUNT) {
             g_pool.bshows[id] = POOL_RETIRED;
@@ -653,6 +1019,7 @@ static void show_phrase_locked(void)
         pool_counts_locked(&active, &unused, &generated);
     }
     g_pool_dirty = true;
+    g_pool_dirty_us = esp_timer_get_time();
     if (unused * 100 < active * POOL_LOW_PCT && g_key[0] && g_available && !g_refill_pending) {
         g_refill_pending = true;
         printf("POOL low: %d/%d unshown, batch refill queued\n", unused, active);
@@ -789,16 +1156,22 @@ static void fetch_balance(const char *key)
             if (cJSON_IsString(currency))
                 snprintf(g_currency, sizeof(g_currency), "%s", currency->valuestring);
             g_available = cJSON_IsTrue(available);
+            if (time_ready()) {
+                time_t wall = time(NULL);
+                struct tm lt;
+                localtime_r(&wall, &lt);
+                snprintf(g_bal_hhmm, sizeof(g_bal_hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
+            }
             detail(g_available ? "" : "不可用");
             if (g_balance_bubble) {
-                snprintf(g_phrase, sizeof(g_phrase), "余额\n%s%s", g_total, strcmp(g_currency, "CNY") ? g_currency : "元");
+                snprintf(g_phrase, sizeof(g_phrase), "%s", PHRASE_BALANCE);
                 g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
             }
             ESP_LOGI(TAG, "balance %s %s available=%d", g_currency, g_total, g_available);
         }
         cJSON_Delete(root);
     }
-    if (g_balance_bubble && !strcmp(g_phrase, "查余额中")) {
+    if (g_balance_bubble && !strcmp(g_phrase, PHRASE_BALANCE_WAIT)) {
         // Failed: show why instead of a stale "querying".
         snprintf(g_phrase, sizeof(g_phrase), "%s", g_detail[0] ? g_detail : "查询失败");
         g_phrase_until_us = esp_timer_get_time() + 6 * 1000000LL;
@@ -900,9 +1273,11 @@ static void fetch_weather(void)
     tz = g_tz_hours;
     has_geo = g_has_geo || g_geo_fixed;
     xSemaphoreGive(mu);
-    int64_t delay = 10LL * 60 * 1000000LL;
+    // Open-Meteo (free, no key, no DeepSeek): every WEATHER_EVERY after a good
+    // fetch, WEATHER_RETRY after a failed one; immediately after Wi-Fi connects.
+    int64_t delay = WEATHER_RETRY_US;
     if (!city[0])
-        delay = 30LL * 60 * 1000000LL;
+        delay = WEATHER_EVERY_US;
     else if (!has_geo) {
         char encoded[160];
         char url[400];
@@ -971,14 +1346,17 @@ static void fetch_weather(void)
             g_wx_today[0] = 0;
             g_wx_tomorrow[0] = 0;
             xSemaphoreGive(mu);
-            delay = 30LL * 60 * 1000000LL;
-            ESP_LOGI(TAG, "weather %s", line);
+            delay = WEATHER_EVERY_US;
+            g_weather_ok_us = esp_timer_get_time();
+            ESP_LOGI(TAG, "weather %s (next in 30 min)", line);
         }
         cJSON_Delete(root);
     }
     xSemaphoreTake(mu, portMAX_DELAY);
     g_next_weather_us = esp_timer_get_time() + delay;
     xSemaphoreGive(mu);
+    if (delay == WEATHER_RETRY_US)
+        ESP_LOGW(TAG, "weather fetch failed, retry in 2 min");
 }
 
 static int llm_day_stamp(void)
@@ -1022,28 +1400,12 @@ static bool llm_take_slot(bool ignore_spacing)
     return ok;
 }
 
-static void utf8_put(char *out, int *used, int size, uint32_t c)
-{
-    int bytes = c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
-    if (*used + bytes >= size)
-        return;
-    if (c < 0x80) {
-        out[(*used)++] = (char)c;
-    } else if (c < 0x800) {
-        out[(*used)++] = (char)(0xc0 | (c >> 6));
-        out[(*used)++] = (char)(0x80 | (c & 0x3f));
-    } else {
-        out[(*used)++] = (char)(0xe0 | (c >> 12));
-        out[(*used)++] = (char)(0x80 | ((c >> 6) & 0x3f));
-        out[(*used)++] = (char)(0x80 | (c & 0x3f));
-    }
-}
-
-// Cleans a generated line in place; false when it must be rejected.
+// Cleans a generated line in place; false when it must be rejected. Lines may
+// use {temp} / {weather}; they are measured filled with the widest values.
 static bool pool_line_ok(char *text)
 {
     static const char *const banned[] = {"政", "党", "主席", "国家", "币", "股", "投资", "理财", "色情", "性感",
-                                         "赌", "毒", "枪", "广告", "http", "AI", "模型"};
+                                         "赌", "毒", "枪", "广告", "http", "AI", "模型", "生日", "{n}"};
     char clean[POOL_TEXT];
     int used = 0, count = 0;
     const unsigned char *cursor = (const unsigned char *)text;
@@ -1070,24 +1432,81 @@ static bool pool_line_ok(char *text)
     for (unsigned i = 0; i < sizeof(banned) / sizeof(banned[0]); ++i)
         if (strstr(clean, banned[i]))
             return false;
-    if (!display_bubble_fits(clean))
+    char filled[POOL_TEXT + 16];
+    if (!fill_line(filled, sizeof(filled), clean, FILL_TEMP_WORST, FILL_WEATHER_WORST))
+        return false; // unknown {placeholder} or stray brace
+    if (!display_bubble_fits(filled))
         return false; // needs more than two bubble lines, or unknown glyphs
     strcpy(text, clean);
     return true;
 }
 
-static int pool_tag_from(const char *t)
+static int parse_time_tag(const char *t)
 {
-    switch (t && t[0] ? t[0] : 'a') {
-    case 'm': return Q_MORNING;
-    case 'n': return Q_NOON;
-    case 'e': return Q_EVENING;
-    case 'x': return Q_NIGHT;
-    case 'r': return Q_RAIN;
-    case 'h': return Q_HOT;
-    case 'c': return Q_COLD;
-    default: return Q_ANY;
+    if (!t)
+        return T_ANY;
+    if (!strcmp(t, "late-night") || !strcmp(t, "late_night") || !strcmp(t, "latenight") || !strcmp(t, "late"))
+        return T_LATE;
+    for (int i = 0; i < T_COUNT; ++i)
+        if (!strcmp(t, T_NAMES[i]))
+            return i;
+    return T_ANY;
+}
+
+static int parse_cond_tag(const char *t)
+{
+    if (!t)
+        return C_GENERAL;
+    for (int i = 0; i < C_COUNT; ++i)
+        if (!strcmp(t, C_NAMES[i]))
+            return i;
+    return C_GENERAL;
+}
+
+// Keeps a tag honest with its text: a line that says 早上 is a morning line, one
+// that mentions rain is a rain line. Fills in an any/general tag from the text
+// and rejects a line whose words contradict its tag.
+static bool tag_consistent(const char *text, int *time_tag, int *cond_tag)
+{
+    static const struct {
+        const char *word;
+        unsigned times; // allowed time buckets (1 << T_*)
+    } time_words[] = {
+        {"早上", 1u << T_MORNING},     {"早安", 1u << T_MORNING},
+        {"起床", 1u << T_MORNING},     {"早餐", 1u << T_MORNING},
+        {"中午", 1u << T_NOON},        {"午饭", 1u << T_NOON},
+        {"午餐", 1u << T_NOON},        {"下午", 1u << T_AFTERNOON},
+        {"傍晚", 1u << T_EVENING},     {"晚饭", 1u << T_EVENING},
+        {"今晚", 1u << T_EVENING | 1u << T_NIGHT},
+        {"晚上", 1u << T_EVENING | 1u << T_NIGHT | 1u << T_LATE},
+        {"晚安", 1u << T_NIGHT | 1u << T_LATE},
+        {"深夜", 1u << T_LATE},        {"熬夜", 1u << T_NIGHT | 1u << T_LATE},
+        {"凌晨", 1u << T_LATE},        {"半夜", 1u << T_LATE},
+    };
+    unsigned allowed = 0;
+    for (unsigned i = 0; i < sizeof(time_words) / sizeof(time_words[0]); ++i)
+        if (strstr(text, time_words[i].word))
+            allowed = allowed ? allowed & time_words[i].times : time_words[i].times;
+    if (allowed && !(allowed & (1u << *time_tag))) {
+        if (*time_tag != T_ANY)
+            return false;
+        for (int t = 1; t < T_COUNT; ++t)
+            if (allowed & (1u << t)) {
+                *time_tag = t;
+                break;
+            }
     }
+    int implied = -1;
+    if (strstr(text, "雨") || strstr(text, "带伞"))
+        implied = C_RAIN;
+    else if (strstr(text, "周末"))
+        implied = C_WEEKEND;
+    if (implied >= 0 && *cond_tag != implied) {
+        if (*cond_tag != C_GENERAL)
+            return false;
+        *cond_tag = implied;
+    }
+    return true;
 }
 
 static bool pool_has_locked(const char *text)
@@ -1115,6 +1534,106 @@ static int pool_free_slot_locked(void)
     return best;
 }
 
+// Appends src to out, replacing every {{name}} with the matching value.
+static void prompt_fill(char *out, size_t size, const char *tpl, const char *const *names,
+                        const char *const *values, int count)
+{
+    size_t used = 0;
+    while (*tpl && used + 1 < size) {
+        if (tpl[0] == '{' && tpl[1] == '{') {
+            const char *end = strstr(tpl + 2, "}}");
+            if (end) {
+                size_t n = (size_t)(end - tpl - 2);
+                for (int i = 0; i < count; ++i)
+                    if (strlen(names[i]) == n && !strncmp(tpl + 2, names[i], n)) {
+                        size_t v = strlen(values[i]);
+                        if (used + v >= size)
+                            v = size - used - 1;
+                        memcpy(out + used, values[i], v);
+                        used += v;
+                        break;
+                    }
+                tpl = end + 2;
+                continue;
+            }
+        }
+        out[used++] = *tpl++;
+    }
+    out[used] = 0;
+}
+
+static const char *season_name(int month)
+{
+    static const char *const names[12] = {"隆冬", "冬末春初", "早春", "春天", "春末夏初", "初夏",
+                                          "盛夏", "盛夏", "初秋", "秋天", "深秋初冬", "冬天"};
+    return month >= 1 && month <= 12 ? names[month - 1] : "未知";
+}
+
+static bool birthday_now_locked(bool have_time, const struct tm *local);
+
+// The user prompt for one refill: PET_USER_PROMPT with the current context.
+static char *pool_user_prompt(void)
+{
+    char *avoid = malloc(800);
+    char *ask = malloc(4096);
+    if (!avoid || !ask) {
+        free(avoid);
+        free(ask);
+        return 0;
+    }
+    char date[32] = "未知", weekday[16] = "", clock[8] = "", daytype[16] = "", season[16] = "未知";
+    char place[40], weather_now[48], count[8], mode[64];
+    const char *bucket = "any", *wclass = "general";
+    int alen = 0;
+    avoid[0] = 0;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    bool have_time = time_ready();
+    struct tm local = {0};
+    if (have_time) {
+        static const char *const wd[7] = {"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"};
+        time_t wall = time(NULL);
+        localtime_r(&wall, &local);
+        snprintf(date, sizeof(date), "%d年%d月%d日", local.tm_year + 1900, local.tm_mon + 1, local.tm_mday);
+        snprintf(weekday, sizeof(weekday), "%s", wd[local.tm_wday % 7]);
+        snprintf(clock, sizeof(clock), "%02d:%02d", local.tm_hour, local.tm_min);
+        snprintf(daytype, sizeof(daytype), "%s", local.tm_wday == 0 || local.tm_wday == 6 ? "周末" : "工作日");
+        snprintf(season, sizeof(season), "%s", season_name(local.tm_mon + 1));
+        bucket = T_NAMES[time_bucket(local.tm_hour)];
+    }
+    PoolCtx ctx;
+    context_now_locked(&ctx);
+    static const int order[] = {C_RAIN, C_HOT, C_COLD, C_CLEAR};
+    for (unsigned i = 0; i < sizeof(order) / sizeof(order[0]); ++i)
+        if (ctx.conds & (1u << order[i])) {
+            wclass = C_NAMES[order[i]];
+            break;
+        }
+    snprintf(place, sizeof(place), "%s", g_city[0] ? g_city : "未知");
+    if (ctx.weather)
+        snprintf(weather_now, sizeof(weather_now), "%s %s", ctx.temp, ctx.wname);
+    else
+        snprintf(weather_now, sizeof(weather_now), "未知");
+    snprintf(mode, sizeof(mode), "%s", birthday_now_locked(have_time, &local) ? "生日模式（这批句子留到平时用）" : "陪伴模式");
+    for (int i = 0; i < POOL_RECENT; ++i)
+        if (g_recent[i] >= 0 && pool_active(g_recent[i]) && alen < 700)
+            alen += snprintf(avoid + alen, 800 - alen, "%s；", pool_text(g_recent[i]));
+    for (int i = 0; i < POOL_GEN_MAX && alen < 700; ++i)
+        if (g_pool.gen[i].text[0] && (esp_random() % 3) == 0)
+            alen += snprintf(avoid + alen, 800 - alen, "%s；", g_pool.gen[i].text);
+    for (int i = 0; i < PET_QUOTE_COUNT && alen < 700; ++i)
+        if ((esp_random() % 4) == 0)
+            alen += snprintf(avoid + alen, 800 - alen, "%s；", PET_QUOTES[i].text);
+    xSemaphoreGive(mu);
+    snprintf(count, sizeof(count), "%d", POOL_BATCH);
+    static const char *const names[] = {"date", "weekday", "clock", "daytype", "bucket", "season", "place",
+                                        "weather_now", "wclass", "mode", "count", "avoid"};
+    const char *values[] = {date, weekday, clock, daytype, bucket, season, place,
+                            weather_now, wclass, mode, count, avoid[0] ? avoid : "无"};
+    prompt_fill(ask, 4096, PET_USER_PROMPT, names, values, (int)(sizeof(names) / sizeof(names[0])));
+    free(avoid);
+    return ask;
+}
+
 static void pool_refill(const char *key)
 {
     bool force;
@@ -1129,48 +1648,28 @@ static void pool_refill(const char *key)
         xSemaphoreGive(mu);
         return;
     }
-    // Lines to avoid: recently shown plus a few stored ones.
-    char *avoid = malloc(800);
-    char *ask = malloc(1400);
-    cJSON *root = cJSON_CreateObject();
-    if (!avoid || !ask || !root) {
-        free(avoid);
+    char *ask = pool_user_prompt();
+    cJSON *root = ask ? cJSON_CreateObject() : 0;
+    if (!root) {
         free(ask);
-        cJSON_Delete(root);
         xSemaphoreTake(mu, portMAX_DELAY);
         g_refill_pending = false;
         xSemaphoreGive(mu);
         return;
     }
-    int alen = 0;
-    avoid[0] = 0;
-    char context[48];
-    xSemaphoreTake(mu, portMAX_DELAY);
-    for (int i = 0; i < POOL_RECENT; ++i)
-        if (g_recent[i] >= 0 && pool_active(g_recent[i]) && alen < 700)
-            alen += snprintf(avoid + alen, 800 - alen, "%s；", pool_text(g_recent[i]));
-    for (int i = 0; i < POOL_GEN_MAX && alen < 700; ++i)
-        if (g_pool.gen[i].text[0] && (esp_random() % 3) == 0)
-            alen += snprintf(avoid + alen, 800 - alen, "%s；", g_pool.gen[i].text);
-    snprintf(context, sizeof(context), "%s", g_weather[0] ? g_weather : "未知");
-    xSemaphoreGive(mu);
-    snprintf(ask, 1400,
-             "请生成%d句不同的话，只输出json：{\"l\":[[\"标签\",\"句子\"],...]}。"
-             "标签用一个字母：a通用 m早上 n中午 e晚上 x深夜 r下雨 h炎热 c寒冷；约一半用a，其余各类都要有。"
-             "每句不超过16个字，用逗号分成两个各不超过8个字的短句，必须能放进两行小字气泡；最多3句带颜文字。现在天气：%s。"
-             "不要和这些重复或太像：%s",
-             POOL_BATCH, context, avoid[0] ? avoid : "无");
+    const char *cut = strstr(ask, "\n\n");
+    printf("POOL refill prompt context:\n%.*s\n", cut ? (int)(cut - ask) : 0, ask);
     cJSON_AddStringToObject(root, "model", LLM_MODEL);
     cJSON *thinking = cJSON_AddObjectToObject(root, "thinking");
     cJSON_AddStringToObject(thinking, "type", "disabled");
     cJSON_AddNumberToObject(root, "temperature", 1.3);
-    cJSON_AddNumberToObject(root, "max_tokens", 1200);
+    cJSON_AddNumberToObject(root, "max_tokens", 1500);
     cJSON *format = cJSON_AddObjectToObject(root, "response_format");
     cJSON_AddStringToObject(format, "type", "json_object");
     cJSON *messages = cJSON_AddArrayToObject(root, "messages");
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role", "system");
-    cJSON_AddStringToObject(sys, "content", PET_PERSONA);
+    cJSON_AddStringToObject(sys, "content", PET_SYSTEM_PROMPT);
     cJSON_AddItemToArray(messages, sys);
     cJSON *user = cJSON_CreateObject();
     cJSON_AddStringToObject(user, "role", "user");
@@ -1178,10 +1677,11 @@ static void pool_refill(const char *key)
     cJSON_AddItemToArray(messages, user);
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    free(avoid);
     free(ask);
     int status = payload ? https_call("https://api.deepseek.com/chat/completions", key, payload) : -1;
     free(payload);
+    if (status != 200)
+        printf("POOL refill http %d: %.200s\n", status, body);
     int added = 0, rejected = 0;
     if (status == 200) {
         cJSON *resp = cJSON_ParseWithLength(body, (size_t)body_len);
@@ -1195,10 +1695,18 @@ static void pool_refill(const char *key)
         cJSON *item;
         cJSON_ArrayForEach(item, list)
         {
-            const char *tag = 0, *text = 0;
-            if (cJSON_IsArray(item)) {
-                cJSON *t = cJSON_GetArrayItem(item, 0), *s = cJSON_GetArrayItem(item, 1);
-                tag = cJSON_IsString(t) ? t->valuestring : 0;
+            const char *ttext = 0, *ctext = 0, *text = 0;
+            if (cJSON_IsArray(item) && cJSON_GetArraySize(item) >= 3) {
+                cJSON *t = cJSON_GetArrayItem(item, 0), *w = cJSON_GetArrayItem(item, 1),
+                      *s = cJSON_GetArrayItem(item, 2);
+                ttext = cJSON_IsString(t) ? t->valuestring : 0;
+                ctext = cJSON_IsString(w) ? w->valuestring : 0;
+                text = cJSON_IsString(s) ? s->valuestring : 0;
+            } else if (cJSON_IsObject(item)) {
+                cJSON *t = cJSON_GetObjectItem(item, "t"), *w = cJSON_GetObjectItem(item, "w"),
+                      *s = cJSON_GetObjectItem(item, "s");
+                ttext = cJSON_IsString(t) ? t->valuestring : 0;
+                ctext = cJSON_IsString(w) ? w->valuestring : 0;
                 text = cJSON_IsString(s) ? s->valuestring : 0;
             } else if (cJSON_IsString(item)) {
                 text = item->valuestring;
@@ -1209,8 +1717,9 @@ static void pool_refill(const char *key)
                 continue;
             }
             strcpy(line, text);
-            if (!pool_line_ok(line)) {
-                printf("POOL reject: %s\n", text);
+            int ttag = parse_time_tag(ttext), ctag = parse_cond_tag(ctext);
+            if (!pool_line_ok(line) || !tag_consistent(line, &ttag, &ctag)) {
+                printf("POOL reject [%s/%s] %s\n", ttext ? ttext : "?", ctext ? ctext : "?", text);
                 ++rejected;
                 continue;
             }
@@ -1219,7 +1728,7 @@ static void pool_refill(const char *key)
             if (slot >= 0) {
                 GenLine *g = &g_pool.gen[slot];
                 memset(g, 0, sizeof(*g));
-                g->tag = (uint8_t)pool_tag_from(tag);
+                g->tag = (uint8_t)(ttag << 4 | ctag);
                 snprintf(g->text, sizeof(g->text), "%s", line);
                 ++added;
             }
@@ -1227,7 +1736,7 @@ static void pool_refill(const char *key)
             if (slot == -2)
                 ++rejected;
             if (slot >= 0)
-                printf("POOL add [%s] %s\n", tag ? tag : "a", line);
+                printf("POOL add [%s/%s] %s\n", T_NAMES[ttag], C_NAMES[ctag], line);
         }
         cJSON_Delete(batch);
     } else if (status == 401 || status == 402) {
@@ -1238,8 +1747,8 @@ static void pool_refill(const char *key)
     }
     xSemaphoreTake(mu, portMAX_DELAY);
     g_refill_pending = false;
-    if (added)
-        ++g_pool_refills;
+    if (added && g_pool.refills < 65535)
+        ++g_pool.refills;
     g_pool_dirty = true;
     xSemaphoreGive(mu);
     pool_save();
@@ -1513,9 +2022,20 @@ void net_init(void)
 
     mu = xSemaphoreCreateMutex();
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (err != ESP_OK) {
+        // Full, newer-format or unreadable NVS: start clean instead of a boot loop.
+        printf("NVS init failed (%s), erasing settings\n", esp_err_to_name(err));
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
+    }
+    {
+        static const char *const reasons[] = {"unknown", "power-on", "external", "software", "panic",
+                                              "int-watchdog", "task-watchdog", "watchdog", "deep-sleep",
+                                              "brownout", "sdio", "usb", "jtag", "efuse", "power-glitch", "cpu-lockup"};
+        esp_reset_reason_t why = esp_reset_reason();
+        g_reset_name = (unsigned)why < sizeof(reasons) / sizeof(reasons[0]) ? reasons[why] : "other";
+        g_boots = load_int("boots", 0, 0, 999999) + 1;
+        save_int("boots", g_boots % 1000000);
     }
     nvs_load("ssid", g_ssid, sizeof(g_ssid));
     nvs_load("pass", g_pass, sizeof(g_pass));
@@ -1535,17 +2055,25 @@ void net_init(void)
     nvs_load("lat", lat_text, sizeof(lat_text));
     nvs_load("lon", lon_text, sizeof(lon_text));
     if (lat_text[0] && lon_text[0]) {
-        g_lat_e6 = atoi(lat_text);
-        g_lon_e6 = atoi(lon_text);
-        g_has_geo = true;
+        int lat = atoi(lat_text), lon = atoi(lon_text);
+        if (lat >= -90000000 && lat <= 90000000 && lon >= -180000000 && lon <= 180000000 && (lat || lon)) {
+            g_lat_e6 = lat;
+            g_lon_e6 = lon;
+            g_has_geo = true;
+        } else {
+            printf("stored coordinates invalid, ignored\n");
+        }
     }
     g_geo_fixed = g_has_geo && load_int("geofix", 0, 0, 1) == 1;
     g_mode = load_int("mode", 0, 0, 1);
     nvs_load("bname", g_bname, sizeof(g_bname));
     g_bmonth = load_int("bmon", 0, 0, 12);
     g_bday = load_int("bday", 0, 0, 31);
-    if (!g_bmonth || !g_bday)
-        g_bmonth = g_bday = 0;
+    {
+        static const int8_t mdays[13] = {0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        if (!g_bmonth || !g_bday || g_bday > mdays[g_bmonth])
+            g_bmonth = g_bday = 0;
+    }
     g_bauto = load_int("bauto", 1, 0, 1) == 1;
     nvs_load("msg", g_msg, sizeof(g_msg));
     g_rpause = load_int("rpause", 0, 0, 1) == 1;
@@ -1599,6 +2127,7 @@ void net_init(void)
     portal_start();
     xTaskCreate(net_task, "net", 20480, 0, 5, &net_task_handle);
     printf("PET READY v0.5\n");
+    printf("boot #%d reset %s; pool %s\n", g_boots, g_reset_name, g_pool_boot);
     printf("Settings: http://pet.local/ or http://<device-ip>/ on the home network; USB serial also works.\n");
     printf("SSID PASS KEY CITY LOC DRINK MOVE QUIET TZ MODE BNAME BDAY BAUTO MSG PAUSE SWEEP SONAR PET POOL BDAYDEMO AP FETCH STATUS SCAN FORGET WEBTEST\n");
     fflush(stdout);
@@ -1730,9 +2259,9 @@ void net_on_sweep(void)
             snprintf(g_phrase, sizeof(g_phrase), "还没联网");
         } else if (queue_fetch(15 * 1000000LL)) {
             g_balance_bubble = true;
-            snprintf(g_phrase, sizeof(g_phrase), "查余额中");
+            snprintf(g_phrase, sizeof(g_phrase), "%s", PHRASE_BALANCE_WAIT);
         } else if (g_total[0]) {
-            snprintf(g_phrase, sizeof(g_phrase), "余额\n%s%s", g_total, strcmp(g_currency, "CNY") ? g_currency : "元");
+            snprintf(g_phrase, sizeof(g_phrase), "%s", PHRASE_BALANCE);
         } else {
             snprintf(g_phrase, sizeof(g_phrase), "稍后再试");
         }
@@ -1789,10 +2318,28 @@ void net_compose(UiState *ui)
         ui->fx_seq = g_fx_seq;
         ui->blow_seq = g_blow_seq;
         ui->candles_out = now_us < g_candles_out_until_us;
-        if (g_phrase[0])
+        if (!strcmp(g_phrase, PHRASE_BALANCE))
+            snprintf(ui->bubble, sizeof(ui->bubble), "余额\n%s%s", g_total, strcmp(g_currency, "CNY") ? g_currency : "元");
+        else if (!strcmp(g_phrase, PHRASE_BALANCE_WAIT))
+            snprintf(ui->bubble, sizeof(ui->bubble), "查余额中");
+        else if (g_phrase[0])
             snprintf(ui->bubble, sizeof(ui->bubble), "%s", g_phrase);
         else
             snprintf(ui->bubble, sizeof(ui->bubble), "祝%s\n生日快乐\xf0\x9f\x8e\x82", g_bname[0] ? g_bname : "你");
+    } else if (!strcmp(g_phrase, PHRASE_BALANCE) || !strcmp(g_phrase, PHRASE_BALANCE_WAIT)) {
+        ui->bal_loading = g_phrase[1] == 'w';
+        if (ui->bal_loading)
+            snprintf(ui->bubble, sizeof(ui->bubble), "查余额中");
+        else
+            snprintf(ui->balance, sizeof(ui->balance), "%s", g_total);
+        if (!strcmp(g_currency, "CNY") || !g_currency[0])
+            snprintf(ui->bal_sign, sizeof(ui->bal_sign), "¥");
+        else if (!strcmp(g_currency, "USD"))
+            snprintf(ui->bal_sign, sizeof(ui->bal_sign), "$");
+        else
+            snprintf(ui->bal_sign, sizeof(ui->bal_sign), "%.7s", g_currency);
+        ui->bal_ok = g_available;
+        snprintf(ui->bal_time, sizeof(ui->bal_time), "%s", g_bal_hhmm);
     } else if (g_phrase[0]) {
         snprintf(ui->bubble, sizeof(ui->bubble), "%s", g_phrase);
     } else if (!g_ssid[0]) {
@@ -2287,15 +2834,24 @@ void net_handle_line(char *line)
         fflush(stdout);
     } else if (!strcmp(line, "WEBTEST")) {
         portal_selftest();
+    } else if (!strcmp(line, "POOL SELFTEST")) {
+        pool_selftest();
+        fflush(stdout);
+    } else if (!strcmp(line, "REBOOT")) {
+        pool_save();
+        printf("rebooting (pool saved)\n");
+        fflush(stdout);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
     } else if (!strcmp(line, "POOL") || !strcmp(line, "POOL REFILL") || !strcmp(line, "POOL LIST")) {
         xSemaphoreTake(mu, portMAX_DELAY);
         int pa, pu, pg;
         pool_counts_locked(&pa, &pu, &pg);
-        printf("pool active %d unshown %d generated %d/%d refills %d\n", pa, pu, pg, POOL_GEN_MAX, g_pool_refills);
+        printf("pool active %d unshown %d generated %d/%d refills %d\n", pa, pu, pg, POOL_GEN_MAX, g_pool.refills);
         if (!strcmp(line, "POOL LIST"))
             for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id)
                 if (pool_active(id))
-                    printf("  #%d tag %d shows %d %s %s\n", id, pool_tag(id),
+                    printf("  #%d [%s/%s] shows %d %s %s\n", id, T_NAMES[pool_time(id)], C_NAMES[pool_cond(id)],
                            id < PET_QUOTE_COUNT ? g_pool.bshows[id] : g_pool.gen[id - PET_QUOTE_COUNT].shows,
                            *pool_used(id) ? "used" : "new ", pool_text(id));
         bool refill = !strcmp(line, "POOL REFILL");
@@ -2344,6 +2900,10 @@ void net_handle_line(char *line)
             char la[16], lo[16];
             fmt_e6(la, sizeof(la), g_lat_e6);
             fmt_e6(lo, sizeof(lo), g_lon_e6);
+            int64_t t_now = esp_timer_get_time();
+            printf("weather refresh every 30 min (retry 2 min): last ok %llds ago, next in %llds\n",
+                   g_weather_ok_us ? (long long)((t_now - g_weather_ok_us) / 1000000LL) : -1LL,
+                   g_next_weather_us > t_now ? (long long)((g_next_weather_us - t_now) / 1000000LL) : 0LL);
             printf("loc %s lat %s lon %s %s today %s tomorrow %s\n", g_city[0] ? g_city : "-",
                    g_has_geo ? la : "-", g_has_geo ? lo : "-", g_geo_fixed ? "fixed" : "geocoded",
                    g_wx_today[0] ? g_wx_today : "-", g_wx_tomorrow[0] ? g_wx_tomorrow : "-");
@@ -2367,7 +2927,24 @@ void net_handle_line(char *line)
         int pa, pu, pg;
         pool_counts_locked(&pa, &pu, &pg);
         printf("pool active %d unshown %d generated %d/%d refills %d%s\n", pa, pu, pg, POOL_GEN_MAX,
-               g_pool_refills, g_refill_pending ? " (refill queued)" : "");
+               g_pool.refills, g_refill_pending ? " (refill queued)" : "");
+        {
+            int shows = 0;
+            for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id)
+                if (pool_active(id))
+                    shows += id < PET_QUOTE_COUNT ? g_pool.bshows[id] : g_pool.gen[id - PET_QUOTE_COUNT].shows;
+            PoolCtx ctx;
+            context_now_locked(&ctx);
+            char now[64];
+            context_text(&ctx, now, sizeof(now));
+            printf("pool shows %d (active lines) context now %s; loaded at boot: %s\n", shows, now, g_pool_boot);
+        }
+        {
+            nvs_stats_t st = {0};
+            nvs_get_stats(NULL, &st);
+            printf("boot #%d reset %s; nvs entries used %u free %u\n", g_boots, g_reset_name,
+                   (unsigned)st.used_entries, (unsigned)st.free_entries);
+        }
         printf("detail %s heap %u min %u uptime %lus\n", g_detail, (unsigned)esp_get_free_heap_size(),
                (unsigned)esp_get_minimum_free_heap_size(), (unsigned long)(esp_timer_get_time() / 1000000LL));
         if (g_ap_active)

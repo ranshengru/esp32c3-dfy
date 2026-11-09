@@ -24,7 +24,8 @@ FONT_SIZE = 16
 BIG_SIZE = 31          # clock digits on the home screen
 BIG_HEIGHT = 25
 BIG_SLOTS = 24
-BIG_CHARS = "0123456789:"
+BIG_CHARS = "0123456789:."  # clock, and the balance amount in the bubble
+
 # Bubble text uses a smaller face so a sentence fits in two lines.
 SMALL_SIZE = 12
 SMALL_HEIGHT = 14
@@ -58,6 +59,8 @@ def characters_from_sources():
     found = {chr(code) for code in range(32, 127)}
     main = ROOT / "firmware" / "idf" / "main"
     for path in sorted(main.glob("*.c")) + sorted(main.glob("*.h")):
+        if path.name == "prompts.h":
+            continue  # prompts go to DeepSeek, never to the screen
         text = path.read_text(encoding="utf-8")
         for literal in STRING_RE.findall(text):
             for char in unescape(literal):
@@ -171,30 +174,30 @@ def raster(faces, character, cell=GLYPH_HEIGHT, threshold=INK_THRESHOLD):
     return width, advance, bytes(bits)
 
 
-def raster_big(font, character):
-    """Clock digits: 24x30 1bpp cells, emboldened by one pixel, shared baseline."""
-    canvas = Image.new("L", (64, 64), 0)
+def raster_big(font, character, height=BIG_HEIGHT, slots=BIG_SLOTS):
+    """Clock / balance digits: 1bpp cells, emboldened by one pixel, shared baseline."""
+    canvas = Image.new("L", (96, 96), 0)
     draw = ImageDraw.Draw(canvas)
     draw.text((4, 4), "0", font=font, fill=255)
     ref = canvas.getbbox()
-    canvas = Image.new("L", (64, 64), 0)
+    canvas = Image.new("L", (96, 96), 0)
     draw = ImageDraw.Draw(canvas)
     draw.text((4, 4), character, font=font, fill=255)
     draw.text((5, 4), character, font=font, fill=255)
     box = canvas.getbbox()
-    top = ref[1] - max(0, (BIG_HEIGHT - (ref[3] - ref[1])) // 2)
-    crop = canvas.crop((box[0], top, box[2], top + BIG_HEIGHT))
-    if crop.width > BIG_SLOTS:
-        crop = crop.resize((BIG_SLOTS, BIG_HEIGHT), Image.Resampling.BOX)
+    top = ref[1] - max(0, (height - (ref[3] - ref[1])) // 2)
+    crop = canvas.crop((box[0], top, box[2], top + height))
+    if crop.width > slots:
+        crop = crop.resize((slots, height), Image.Resampling.BOX)
     bits = bytearray()
     width = 0
-    for y in range(BIG_HEIGHT):
+    for y in range(height):
         row = 0
-        for x in range(min(crop.width, BIG_SLOTS)):
+        for x in range(min(crop.width, slots)):
             if crop.getpixel((x, y)) >= INK_THRESHOLD:
-                row |= 1 << (BIG_SLOTS - 1 - x)
+                row |= 1 << (slots - 1 - x)
                 width = max(width, x + 1)
-        bits += row.to_bytes(3, "big")
+        bits += row.to_bytes(slots // 8, "big")
     advance = width + 2
     return width, advance, bytes(bits)
 
@@ -271,7 +274,14 @@ WISH_RE = re.compile(r'BIRTHDAY_WISHES\[\] = \{(.*?)\};', re.S)
 # Worst-case name for the birthday wish check: three full-width hanzi.
 WISH_TEST_NAME = "國國國"
 
-QUOTE_RE = re.compile(r'\{\s*Q_[A-Z]+\s*,\s*"((?:\\.|[^"\\])*)"\s*\}')
+QUOTE_RE = re.compile(r'\{\s*T_[A-Z]+\s*,\s*C_[A-Z]+\s*,\s*"((?:\\.|[^"\\])*)"\s*\}')
+# Widest values the device can put into {temp} / {weather} at display time.
+FILL_TEMP = "-10°C"
+FILL_WEATHER = "雷阵雨"
+
+
+def fill_placeholders(line):
+    return line.replace("{temp}", FILL_TEMP).replace("{weather}", FILL_WEATHER)
 
 
 def check_quotes(small):
@@ -280,7 +290,8 @@ def check_quotes(small):
     text = (ROOT / "firmware" / "idf" / "main" / "quotes.h").read_text(encoding="utf-8")
     quotes = [unescape(q) for q in QUOTE_RE.findall(text)]
     bad = []
-    for quote in quotes:
+    for raw in quotes:
+        quote = fill_placeholders(raw)
         missing = [c for c in quote if ord(c) not in advances and c != "\n" and ord(c) != CAKE]
         if missing or layout_bubble(quote, advances) is None:
             bad.append((quote, text_width(quote, advances), "".join(missing)))
@@ -333,6 +344,7 @@ def write_glyphs(path, glyphs, big=(), small=()):
         lines.append(f"    {{'{ch}', {width}, {advance}, {{{blob}}}}},")
     lines.append("};")
     lines.append(f"enum {{ BIG_COUNT = {len(big)} }};")
+
     lines.append("")
     lines.append(f"enum {{ SMALL_HEIGHT = {SMALL_HEIGHT} }};")
     lines.append("typedef struct { uint16_t codepoint; uint8_t width; uint8_t advance; uint8_t bits[SMALL_HEIGHT * 2]; } SmallGlyph;")

@@ -594,8 +594,9 @@ static int draw_big(int x, int y, char ch, bool visible)
     const BigGlyph *g = big_glyph(ch);
     if (!g)
         return 0;
-    int advance = ch == ':' ? g->advance : big_digit_advance();
-    int offset = ch == ':' ? 0 : (advance - 2 - g->width) / 2;
+    bool narrow = ch == ':' || ch == '.';
+    int advance = narrow ? g->advance : big_digit_advance();
+    int offset = narrow ? 0 : (advance - 2 - g->width) / 2;
     if (visible)
         for (int row = 0; row < BIG_HEIGHT; ++row) {
             uint32_t bits = ((uint32_t)g->bits[row * 3] << 16) | ((uint32_t)g->bits[row * 3 + 1] << 8) |
@@ -725,8 +726,120 @@ static void paint_home(const UiState *ui)
     }
 }
 
+// Draws a clock digit scaled to pct percent (nearest neighbour, proportional
+// advance); returns the advance.
+static int draw_big_scaled(int x, int y, char ch, int pct)
+{
+    const BigGlyph *g = big_glyph(ch);
+    if (!g)
+        return 0;
+    int w = (g->width * pct + 50) / 100, h = (BIG_HEIGHT * pct + 50) / 100;
+    for (int oy = 0; oy < h; ++oy) {
+        int row = oy * 100 / pct;
+        if (row >= BIG_HEIGHT)
+            row = BIG_HEIGHT - 1;
+        uint32_t bits = ((uint32_t)g->bits[row * 3] << 16) | ((uint32_t)g->bits[row * 3 + 1] << 8) |
+                        g->bits[row * 3 + 2];
+        for (int ox = 0; ox < w; ++ox) {
+            int col = ox * 100 / pct;
+            if (col < g->width && (bits & (1u << (BIG_SLOTS - 1 - col))))
+                put(x + ox, y + oy, BUBBLE_INK);
+        }
+    }
+    return w + (pct >= 80 ? 2 : 1);
+}
+
+static int big_scaled_width(const char *text, int pct)
+{
+    int w = 0;
+    for (const char *p = text; *p; ++p) {
+        const BigGlyph *g = big_glyph(*p);
+        if (g)
+            w += (g->width * pct + 50) / 100 + (pct >= 80 ? 2 : 1);
+    }
+    return w;
+}
+
+static int small_text_width(const char *text)
+{
+    int w = 0;
+    const char *p = text;
+    uint32_t c;
+    while ((c = utf8_next(&p)) != 0) {
+        const SmallGlyph *g = find_small(c);
+        w += g ? g->advance : 8;
+    }
+    return w;
+}
+
+static int draw_small_text(int x, int y, const char *text)
+{
+    const char *p = text;
+    uint32_t c;
+    while ((c = utf8_next(&p)) != 0) {
+        const SmallGlyph *g = find_small(c);
+        if (!g) {
+            x += 8;
+            continue;
+        }
+        draw_small(x, y, g);
+        x += g->advance;
+    }
+    return x;
+}
+
+// Double-sweep balance: the normal oval bubble, one line "余额 ¥22.54" with
+// the amount in the clock digits. Label and sign use the 12px bubble font and
+// sit on the digits' baseline. The amount scales down to fit (9999.99 fits).
+static void draw_balance_bubble(const UiState *ui)
+{
+    enum { W = WIDTH, H = BUBBLE_AREA, PAD = 6 };
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            if (!ellipse_contains(x, y, W, H, false))
+                continue;
+            put(x, y, ellipse_contains(x, y, W, H, true) ? WHITE : BUBBLE_INK);
+        }
+    const char *label = "余额";
+    int label_w = small_text_width(label);
+    int sign_w = small_text_width(ui->bal_sign);
+    int gap = 4;
+    // Usable width on the rows the digits cover (ellipse narrows away from the middle).
+    int pct = 100;
+    for (; pct > 40; pct -= 4) {
+        int dh = (BIG_HEIGHT * pct + 50) / 100;
+        int half = dh / 2 + 1;
+        int ry = H / 2, rx = W / 2;
+        // half-width of the ellipse at |dy| = half: rx * sqrt(1 - (half/ry)^2)
+        int frac = 1000 - half * half * 1000 / (ry * ry);
+        int s = 0;
+        while ((s + 1) * (s + 1) <= frac * 1000)
+            ++s; // s = sqrt(frac/1000) * 1000
+        int avail = 2 * rx * s / 1000 - 2 * PAD;
+        if (label_w + gap + sign_w + 1 + big_scaled_width(ui->balance, pct) <= avail)
+            break;
+    }
+    int digits_w = big_scaled_width(ui->balance, pct);
+    int digits_h = (BIG_HEIGHT * pct + 50) / 100;
+    int total = label_w + gap + sign_w + 1 + digits_w;
+    int x = (W - total) / 2;
+    int top = (H - digits_h) / 2;
+    int base = top + digits_h; // digits' baseline (bottom of the cell)
+    int small_y = base - SMALL_HEIGHT + 1;
+    draw_small_text(x, small_y, label);
+    x += label_w + gap;
+    draw_small_text(x, small_y, ui->bal_sign);
+    x += sign_w + 1;
+    for (const char *p = ui->balance; *p; ++p)
+        x += draw_big_scaled(x, top, *p, pct);
+}
+
 static void paint_overlay(const UiState *ui)
 {
+    if (ui->balance[0]) {
+        draw_balance_bubble(ui);
+        return;
+    }
     if (ui->bubble[0]) {
         draw_bubble(ui->bubble);
         return;

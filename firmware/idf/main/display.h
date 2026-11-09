@@ -23,6 +23,13 @@ typedef struct {
     char cond[16];   // "多云"
     int icon;        // UiIcon
     char note[40];   // optional pill: reminder, message, countdown, IP
+    // Full-screen balance page (double sweep): amount in the 44px balance
+    // digits, e.g. "22.54", small currency sign; bal_loading shows "查询中".
+    char balance[16];
+    char bal_sign[8]; // "¥" for CNY, "$" for USD, else the code
+    bool bal_loading;
+    bool bal_ok;      // account usable
+    char bal_time[8]; // "00:41", last successful query
     // Birthday party screen: cake with candles, fireworks, blow-out.
     bool party;
     bool candles_out;

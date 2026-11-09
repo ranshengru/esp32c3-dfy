@@ -4,37 +4,49 @@
 #include <stdint.h>
 
 // 20 seed lines for the single-sweep bubble, in the voice of 大肥鱼. More come
-// from the rare DeepSeek batch refill (net.c, pool_*).
-// tools/gen_idf_assets.py fails the build if any line needs more than two
-// bubble lines (12px font, 104px) or uses a character outside the glyph set.
-enum { Q_ANY, Q_MORNING, Q_NOON, Q_EVENING, Q_NIGHT, Q_RAIN, Q_HOT, Q_COLD, Q_TAGS };
+// from the rare DeepSeek batch refill (net.c pool_refill, prompts in prompts.h).
+// Every line carries a bucket: a time of day x a condition. At display time the
+// device only picks lines whose time is T_ANY or the current time bucket and
+// whose condition is C_GENERAL or one that holds right now (see net.c
+// context_now). {temp} and {weather} are filled at display time ("7°C", "小雨").
+// tools/gen_idf_assets.py fails the build if any line (filled with the widest
+// values "-10°C" / "雷阵雨") needs more than two bubble lines (12px font,
+// 104px) or uses a character outside the glyph set.
+enum { T_ANY, T_MORNING, T_NOON, T_AFTERNOON, T_EVENING, T_NIGHT, T_LATE, T_COUNT };
+enum { C_GENERAL, C_RAIN, C_HOT, C_COLD, C_CLEAR, C_WEEKEND, C_COUNT };
+
+// Hours of each time bucket: morning 5-10, noon 11-13, afternoon 14-16,
+// evening 17-19, night 20-22, late-night 23-4.
+static const char *const T_NAMES[T_COUNT] = {"any", "morning", "noon", "afternoon", "evening", "night", "late-night"};
+static const char *const C_NAMES[C_COUNT] = {"general", "rain", "hot", "cold", "clear", "weekend"};
 
 typedef struct {
-    uint8_t tag;
+    uint8_t time;
+    uint8_t cond;
     const char *text;
 } PetQuote;
 
 static const PetQuote PET_QUOTES[] = {
-    {Q_MORNING, "早上好呀，本鱼醒得好早。"},
-    {Q_MORNING, "眼罩推上去啦，本鱼正式开机。"},
-    {Q_MORNING, "新的一天开始啦 (＞ω＜)"},
-    {Q_NOON, "中午啦，主人吃饭了没有呀？"},
-    {Q_NOON, "本鱼想吃白饭，配红烧肉。"},
-    {Q_EVENING, "晚上好呀，今天辛苦啦。"},
-    {Q_EVENING, "今晚想看星星，你要一起吗？"},
-    {Q_NIGHT, "夜深了，主人该睡觉了哦。"},
-    {Q_NIGHT, "晚安啦，明天见 ´-ω-`"},
-    {Q_RAIN, "外面下雨了，出门记得带伞哦。"},
-    {Q_HOT, "今天好热，本鱼快被清蒸了。"},
-    {Q_COLD, "今天好冷，多穿一件外套吧。"},
-    {Q_ANY, "摸到我啦，本鱼有点开心。"},
-    {Q_ANY, "清蒸还是红烧？都不要啦！"},
-    {Q_ANY, "服务器繁忙，请稍后再摸我。"},
-    {Q_ANY, "本鱼不是笨，是在深度思考。"},
-    {Q_ANY, "喝口水吧，你好久没喝水了。"},
-    {Q_ANY, "被发现在偷懒了 (´・ω・`)"},
-    {Q_ANY, "今天也辛苦你啦 (｡•ᴗ-)✧"},
-    {Q_ANY, "哼，我才没有在等你呢。"},
+    {T_MORNING, C_GENERAL, "早上好呀，本鱼醒得好早。"},
+    {T_MORNING, C_GENERAL, "眼罩推上去啦，本鱼正式开机。"},
+    {T_MORNING, C_COLD, "早上才{temp}，起床多穿点哦。"},
+    {T_NOON, C_GENERAL, "中午啦，主人吃饭了没有呀？"},
+    {T_NOON, C_GENERAL, "本鱼想吃白饭，配红烧肉。"},
+    {T_AFTERNOON, C_GENERAL, "下午好困呀，一起摸会儿鱼？"},
+    {T_EVENING, C_GENERAL, "今天也辛苦你啦 (｡•ᴗ-)✧"},
+    {T_NIGHT, C_CLEAR, "今晚天气晴，想和你看星星。"},
+    {T_LATE, C_GENERAL, "这么晚了，主人该睡觉了哦。"},
+    {T_LATE, C_GENERAL, "本鱼困了，晚安啦 ´-ω-`"},
+    {T_ANY, C_RAIN, "外面{weather}，出门记得带伞。"},
+    {T_ANY, C_HOT, "现在{temp}，本鱼快被清蒸了。"},
+    {T_ANY, C_COLD, "才{temp}呀，多穿一件外套吧。"},
+    {T_ANY, C_WEEKEND, "周末啦，多睡一会儿吧。"},
+    {T_ANY, C_GENERAL, "摸到我啦，本鱼有点开心。"},
+    {T_ANY, C_GENERAL, "清蒸还是红烧？都不要啦！"},
+    {T_ANY, C_GENERAL, "服务器繁忙，请稍后再摸我。"},
+    {T_ANY, C_GENERAL, "本鱼不是笨，是在深度思考。"},
+    {T_ANY, C_GENERAL, "被发现在偷懒了 (´・ω・`)"},
+    {T_ANY, C_GENERAL, "哼，我才没有在等你呢。"},
 };
 
 #define PET_QUOTE_COUNT ((int)(sizeof(PET_QUOTES) / sizeof(PET_QUOTES[0])))
@@ -56,9 +68,5 @@ static const char *const BIRTHDAY_WISHES[] = {
 };
 
 #define BIRTHDAY_WISH_COUNT ((int)(sizeof(BIRTHDAY_WISHES) / sizeof(BIRTHDAY_WISHES[0])))
-
-// System prompt for the rare batch refill (see net.c pool_refill).
-#define PET_PERSONA \
-    "你是大肥鱼，主人桌上的桌宠陪伴少女。DeepSeek 的鲸鱼标志被网友叫成大肥鱼，你就是她的拟人：蓝色头发，爱吃白饭，总是困困的，眼罩推上去就是醒了；温柔俏皮，有一点点傲娇，偶尔犯蠢也可爱，认真起来会深度思考；有时自称本鱼，会开清蒸红烧、服务器繁忙之类的自嘲玩笑。用第一人称对主人说话，每句只表达一个完整清楚的意思，必须是通顺自然、合乎逻辑的完整一句话，不要拼凑词语。每句不超过16个字（含标点），要在两行小字气泡里放下：最好用逗号分成前后两个短句，每个短句不超过8个字。可以结合早上、中午、晚上、深夜、下雨、炎热、寒冷。偶尔可以在句尾加一个简短颜文字，只能用这几个：(´・ω・`) (＞ω＜) ´-ω-` (｡•ᴗ-)✧，不要用 emoji。只用常用简体汉字和中文标点。不涉及政治、色情、暴力、币圈、投资、广告。"
 
 #endif
