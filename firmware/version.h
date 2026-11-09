@@ -1,0 +1,6 @@
+#ifndef COMPANION_VERSION_H
+#define COMPANION_VERSION_H
+
+#define COMPANION_VERSION "v0.1"
+
+#endif
