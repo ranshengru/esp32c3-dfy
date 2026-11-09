@@ -1,4 +1,4 @@
-"""Build the small status font and the v0.1 portrait bytes for the IDF app.
+"""Build a Noto Sans CJK SC glyph subset and v0.1 portrait bytes for the IDF app.
 
 The freestanding image keeps a full GB2312 font in DRAM. This stage only needs
 the status strings, so the glyph table is the ASCII set plus every non-ASCII
@@ -15,12 +15,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parents[1]
 WIDTH, HEIGHT = 128, 160
-GLYPH_HEIGHT = 14
+GLYPH_HEIGHT = 16
 GLYPH_SLOTS = 16
 PORTRAIT_SHIFT_DOWN = 10
 INK_THRESHOLD = 128
+FONT_SIZE = 16
 
-STRING_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
+STRING_RE = re.compile(r'"((?:\\.|[^"\\\n])*)"')
 ESCAPE_RE = re.compile(r'\\(?:x([0-9a-fA-F]{2})|([nrt\\"]))')
 
 
@@ -58,16 +59,10 @@ def load_font(path, size, index):
 
 
 def default_fonts():
-    candidates = [
-        Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
-        Path("/System/Library/Fonts/Hiragino Sans GB.ttc"),
-        Path("/System/Library/Fonts/STHeiti Medium.ttc"),
-    ]
-    for path in candidates:
-        if path.exists():
-            index = 2 if "Hiragino" in path.name else 0
-            return path, index
-    raise SystemExit("no CJK font found; pass --font")
+    path = ROOT / "assets" / "fonts" / "NotoSansCJKsc-Regular.otf"
+    if not path.exists():
+        raise SystemExit(f"missing bundled font: {path}; pass --font to use another font")
+    return path, 0
 
 
 def raster(font, character):
@@ -201,7 +196,7 @@ def main():
         font_path, font_index = default_fonts()
         if args.font_index is not None:
             font_index = args.font_index
-    font = load_font(font_path, 13, font_index)
+    font = load_font(font_path, FONT_SIZE, font_index)
     glyphs = []
     for char in characters_from_sources():
         width, advance, bits = raster(font, char)

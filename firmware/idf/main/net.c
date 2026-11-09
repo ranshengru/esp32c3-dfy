@@ -42,6 +42,7 @@ static char g_granted[16];
 static char g_topped[16];
 static char g_currency[8];
 static bool g_connected;
+static bool g_scan_in_progress;
 static bool g_available;
 static bool g_fetch_pending;
 static int64_t g_last_fetch_us;
@@ -71,6 +72,7 @@ static bool g_arm_double;
 static char g_api_line[32];
 static bool g_quote_pending;
 static int64_t g_next_quote_us;
+static wifi_ap_record_t g_scan_records[24];
 
 static void label(const char *text)
 {
@@ -212,11 +214,6 @@ static bool queue_fetch(int64_t min_gap_us)
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
-    if (base == WIFI_EVENT &&
-        (id == WIFI_EVENT_AP_STACONNECTED || id == WIFI_EVENT_AP_STADISCONNECTED)) {
-        ESP_LOGI(TAG, "ap event %ld", (long)id);
-        return;
-    }
     bool kick = false;
     xSemaphoreTake(mu, portMAX_DELAY);
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
@@ -780,7 +777,7 @@ static void net_task(void *arg)
         memcpy(key, g_key, sizeof(key));
         memcpy(ssid, g_ssid, sizeof(ssid));
         int64_t now = esp_timer_get_time();
-        retry = !connected && ssid[0] && g_retry_at_us && now >= g_retry_at_us;
+        retry = !connected && !g_scan_in_progress && ssid[0] && g_retry_at_us && now >= g_retry_at_us;
         if (retry) {
             g_retry_at_us = now + 8000000;
             label("连接中");
@@ -821,16 +818,109 @@ static void copy_field(char *dest, size_t dest_len, const char *src)
     snprintf(dest, dest_len, "%s", src);
 }
 
-static void fill_ap_config(wifi_config_t *cfg)
+static const char *auth_name(wifi_auth_mode_t mode)
 {
-    memset(cfg, 0, sizeof(*cfg));
-    memcpy(cfg->ap.ssid, PET_AP_SSID, sizeof(PET_AP_SSID));
-    cfg->ap.ssid_len = sizeof(PET_AP_SSID) - 1;
-    memcpy(cfg->ap.password, PET_AP_PASS, sizeof(PET_AP_PASS));
-    cfg->ap.channel = 1;
-    cfg->ap.max_connection = 2;
-    cfg->ap.authmode = WIFI_AUTH_WPA2_PSK;
-    cfg->ap.pmf_cfg.required = false;
+    switch (mode) {
+    case WIFI_AUTH_OPEN: return "OPEN";
+    case WIFI_AUTH_WEP: return "WEP";
+    case WIFI_AUTH_WPA_PSK: return "WPA";
+    case WIFI_AUTH_WPA2_PSK: return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK: return "WPA/WPA2";
+    case WIFI_AUTH_WPA3_PSK: return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+    case WIFI_AUTH_OWE: return "OWE";
+    default: return "OTHER";
+    }
+}
+
+static void scan_wifi_task(void *arg)
+{
+    (void)arg;
+    char target[sizeof(g_ssid)];
+    bool was_connected;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    copy_field(target, sizeof(target), g_ssid);
+    was_connected = g_connected;
+    xSemaphoreGive(mu);
+
+    if (!was_connected) {
+        (void)esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    wifi_scan_config_t config = {
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active = {.min = 100, .max = 180},
+    };
+    esp_err_t err = esp_wifi_scan_start(&config, true);
+    if (err != ESP_OK) {
+        printf("scan failed: %s\n", esp_err_to_name(err));
+    } else {
+        uint16_t total = 0;
+        err = esp_wifi_scan_get_ap_num(&total);
+        if (err != ESP_OK) {
+            printf("scan result failed: %s\n", esp_err_to_name(err));
+        } else {
+            uint16_t count = total < 24 ? total : 24;
+            err = esp_wifi_scan_get_ap_records(&count, g_scan_records);
+            if (err != ESP_OK) {
+                printf("scan result failed: %s\n", esp_err_to_name(err));
+            } else {
+                printf("scan: %u networks in 2.4 GHz; * marks %s\n", (unsigned)total,
+                       target[0] ? target : "no saved SSID");
+                for (uint16_t i = 0; i < count; ++i) {
+                    char name[sizeof(g_scan_records[i].ssid) + 1];
+                    memcpy(name, g_scan_records[i].ssid, sizeof(g_scan_records[i].ssid));
+                    name[sizeof(g_scan_records[i].ssid)] = 0;
+                    printf("%c ch=%u rssi=%d auth=%s ssid=", strcmp(name, target) == 0 ? '*' : ' ',
+                           g_scan_records[i].primary, g_scan_records[i].rssi,
+                           auth_name(g_scan_records[i].authmode));
+                    for (size_t j = 0; j < sizeof(g_scan_records[i].ssid) && g_scan_records[i].ssid[j]; ++j) {
+                        unsigned char c = g_scan_records[i].ssid[j];
+                        putchar((c < 0x20 || c == 0x7f) ? '?' : c);
+                    }
+                    putchar('\n');
+                }
+                if (total > count)
+                    printf("showing strongest %u of %u networks\n", (unsigned)count, (unsigned)total);
+            }
+        }
+    }
+    fflush(stdout);
+
+    xSemaphoreTake(mu, portMAX_DELAY);
+    g_scan_in_progress = false;
+    if (!g_connected && g_ssid[0])
+        g_retry_at_us = esp_timer_get_time() + 1000000;
+    xSemaphoreGive(mu);
+    vTaskDelete(NULL);
+}
+
+static void start_scan_wifi(void)
+{
+    xSemaphoreTake(mu, portMAX_DELAY);
+    if (g_scan_in_progress) {
+        xSemaphoreGive(mu);
+        printf("scan already running\n");
+        fflush(stdout);
+        return;
+    }
+    g_scan_in_progress = true;
+    g_retry_at_us = 0;
+    xSemaphoreGive(mu);
+
+    if (xTaskCreate(scan_wifi_task, "wifi_scan", 8192, 0, 4, 0) != pdPASS) {
+        xSemaphoreTake(mu, portMAX_DELAY);
+        g_scan_in_progress = false;
+        if (!g_connected && g_ssid[0])
+            g_retry_at_us = esp_timer_get_time() + 1000000;
+        xSemaphoreGive(mu);
+        printf("could not start scan task\n");
+        fflush(stdout);
+        return;
+    }
+    printf("scan started; results will follow\n");
+    fflush(stdout);
 }
 
 void net_init(void)
@@ -874,28 +964,31 @@ void net_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-    esp_netif_create_default_wifi_ap();
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, 0));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, 0));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     if (g_ssid[0] && (!g_pass[0] || strlen(g_pass) >= 8)) {
         wifi_config_t sta;
         fill_sta_config(&sta, g_ssid, g_pass);
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
     }
-    wifi_config_t ap;
-    fill_ap_config(&ap);
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG, "Wi-Fi power save disabled");
+    // ESP-IDF takes quarter-dBm; on ESP32-C3, 34 (8.5 dBm request) maps to
+    // the nearest supported RF tier below 8.5 dBm.
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(34));
+    int8_t tx_power = 0;
+    ESP_ERROR_CHECK(esp_wifi_get_max_tx_power(&tx_power));
+    ESP_LOGI(TAG, "Wi-Fi max TX power: %d quarter-dBm", tx_power);
     portal_start();
-
     xTaskCreate(net_task, "net", 20480, 0, 5, &net_task_handle);
     printf("PET READY v0.4\n");
-    printf("AP %s password %s http://192.168.4.1\n", PET_AP_SSID, PET_AP_PASS);
-    printf("SSID PASS KEY CITY DRINK MOVE QUIET TZ FETCH STATUS FORGET\n");
+    printf("Open http://<device-ip>/ from the same home network; USB serial settings also work.\n");
+    printf("SSID PASS KEY CITY DRINK MOVE QUIET TZ FETCH STATUS SCAN FORGET\n");
     fflush(stdout);
 }
 
@@ -942,14 +1035,14 @@ void net_compose(UiState *ui)
         g_phrase[0] = 0;
     if (!g_ssid[0]) {
         snprintf(ui->line[0], UI_COLS, "小粤");
-        snprintf(ui->line[1], UI_COLS, "连热点改设置");
-        snprintf(ui->line[2], UI_COLS, "%s", PET_AP_SSID);
-        snprintf(ui->line[3], UI_COLS, "密码 %s", PET_AP_PASS);
+        snprintf(ui->line[1], UI_COLS, "请用USB连接");
+        snprintf(ui->line[2], UI_COLS, "串口设置WiFi");
+        snprintf(ui->line[3], UI_COLS, "SSID和密码");
     } else if (!g_connected) {
         snprintf(ui->line[0], UI_COLS, "小粤");
         snprintf(ui->line[1], UI_COLS, "%s", g_wifi);
         snprintf(ui->line[2], UI_COLS, "%s", g_ssid);
-        snprintf(ui->line[3], UI_COLS, "热点 %s", PET_AP_SSID);
+        snprintf(ui->line[3], UI_COLS, "USB串口可改设置");
     } else if (!time_ready()) {
         snprintf(ui->line[0], UI_COLS, "小粤");
         snprintf(ui->line[1], UI_COLS, "%s", g_ip[0] ? g_ip : "等待地址");
@@ -1211,9 +1304,12 @@ void net_handle_line(char *line)
                g_drink_min, g_move_min, g_quiet_start, g_quiet_end, g_drinks_today);
         printf("quote %s detail %s heap %u\n",
                g_api_line[0] ? g_api_line : "-", g_detail, (unsigned)esp_get_free_heap_size());
-        printf("ap %s password %s http://192.168.4.1\n", PET_AP_SSID, PET_AP_PASS);
+        printf("web http://%s/ (same LAN); USB serial settings enabled\n",
+               g_ip[0] ? g_ip : "no-IP-yet");
         xSemaphoreGive(mu);
         fflush(stdout);
+    } else if (!strcmp(line, "SCAN")) {
+        start_scan_wifi();
     } else if (!strcmp(line, "FORGET")) {
         nvs_handle_t handle;
         if (nvs_open(NVS_NS, NVS_READWRITE, &handle) == ESP_OK) {
@@ -1239,7 +1335,7 @@ void net_handle_line(char *line)
         printf("cleared\n");
         fflush(stdout);
     } else if (line[0]) {
-        printf("commands: SSID, PASS, KEY, CITY, DRINK, MOVE, QUIET, TZ, FETCH, STATUS, FORGET\n");
+        printf("commands: SSID, PASS, KEY, CITY, DRINK, MOVE, QUIET, TZ, FETCH, STATUS, SCAN, FORGET\n");
         fflush(stdout);
     }
 }

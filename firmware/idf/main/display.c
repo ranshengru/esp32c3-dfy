@@ -14,9 +14,9 @@ enum {
     HEIGHT = 160,
     PIN_RESET = 3,
     PIN_CLOCK = 4,
-    PIN_MOSI = 20,
+    PIN_MOSI = 9,
     PIN_CS = 10,
-    PIN_DC = 21,
+    PIN_DC = 8,
     INK = 0x10e7,
     WHITE = 0xffff,
     LINE_PITCH = 16,
@@ -80,7 +80,9 @@ static void panel_init(void)
         .quadhd_io_num = -1,
         .max_transfer_sz = 1024,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_DISABLED));
+    // The panel sends 256-byte rows. With DMA disabled the ESP32-C3 SPI
+    // driver's host limit is only 64 bytes, so enable DMA for these transfers.
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
     spi_device_interface_config_t dev = {
         .clock_speed_hz = 12000000,
         .mode = 0,

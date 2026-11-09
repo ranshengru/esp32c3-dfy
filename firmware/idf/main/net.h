@@ -6,11 +6,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Fixed SoftAP. The password is a desk-toy secret: it is printed at boot
-// and shown on screen until a home network is saved.
-#define PET_AP_SSID "xiaoyue-pet"
-#define PET_AP_PASS "pet-setup"
-
 void net_init(void);
 void net_compose(UiState *ui);
 void net_request_fetch(void);
