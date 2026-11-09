@@ -150,6 +150,13 @@ static const Glyph *find_glyph(uint16_t codepoint)
     return 0;
 }
 
+bool display_has_glyph(uint32_t codepoint)
+{
+    if (codepoint > 0xffff)
+        return false;
+    return find_glyph((uint16_t)codepoint) != 0;
+}
+
 static int draw_glyph(int x, int y, const Glyph *glyph, uint16_t color)
 {
     for (int row = 0; row < GLYPH_HEIGHT; ++row) {

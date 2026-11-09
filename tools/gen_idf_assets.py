@@ -162,9 +162,9 @@ def preview(canvas, glyphs, destination):
 
     frames = []
     samples = [
-        ["小粤", "未设置网络", "SSID 网络名", "KEY 密钥"],
-        ["小粤", "已连接 21:09", "余额 12.50 CNY", "扫一下刷新"],
-        ["小粤", "连接中", "demo-ssid", "查询失败"],
+        ["小粤", "连热点改设置", "xiaoyue-pet", "密码 pet-setup"],
+        ["小粤 21:09", "多云 26度", "余额 12.50 CNY", "该喝水了"],
+        ["小粤 21:09", "晴 18度", "余额 3.20 CNY", "摸到我啦"],
     ]
     for lines in samples:
         frame = canvas.copy()

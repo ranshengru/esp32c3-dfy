@@ -64,7 +64,7 @@ static void sonar_task(void *arg)
         uint32_t tick = (uint32_t)(esp_timer_get_time() * 16);
         if (update_sweep(&gate, tick, mm)) {
             ESP_LOGI("sonar", "sweep");
-            net_request_fetch();
+            net_on_sweep();
         }
         vTaskDelay(pdMS_TO_TICKS(70));
     }

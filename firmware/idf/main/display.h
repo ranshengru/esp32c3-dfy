@@ -2,6 +2,7 @@
 #define COMPANION_DISPLAY_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 enum { UI_LINES = 8, UI_COLS = 40 };
 
@@ -13,5 +14,7 @@ void display_init(void);
 // Draw over the v0.1 portrait. Empty lines are skipped. Orientation matches the
 // bare-metal image: visual top-left is the text area above the character.
 void display_show(const UiState *ui);
+// True when the small status font can draw this codepoint.
+bool display_has_glyph(uint32_t codepoint);
 
 #endif
