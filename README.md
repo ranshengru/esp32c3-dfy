@@ -67,4 +67,6 @@ python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodem1101 write-flash 0x0 or
 
 ## 后续规划
 
-下一阶段再加入 Wi-Fi 配网、时间和天气显示、DeepSeek Harness 用量摘要，以及用于更改 API 密钥的本地网页设置页。
+联网和 DeepSeek 余额在 [`firmware/idf`](firmware/idf)。那是单独的 ESP-IDF 工程，不塞进 v0.1 的裸机镜像：Wi-Fi 放不进 16KB IRAM。v0.1 的气泡和动画保持原样。刷 IDF 版本前先做整片闪存备份，说明写在该目录的 README 里。
+
+还没做：台词气泡、喝水/走动提醒、天气、网页配网。
