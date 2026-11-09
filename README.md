@@ -65,6 +65,6 @@ python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodem1101 write-flash 0x0 or
 
 开机后 USB 串口会输出 `PET READY v0.1`。本程序直接占用应用槽位，不保留原来的应用；恢复备份可还原原固件。
 
-## 后续规划
+## 联网版 v0.5（ESP-IDF）
 
-联网、天气、喝水/久坐提醒和热点设置页在 [`firmware/idf`](firmware/idf)。那是单独的 ESP-IDF 工程，不塞进 v0.1 的裸机镜像：Wi-Fi 放不进 16KB IRAM。v0.1 的气泡和动画保持原样。刷 IDF 版本前先做整片闪存备份，说明写在该目录的 README 里。
+联网版在 [`firmware/idf`](firmware/idf)，是单独的 ESP-IDF 工程（Wi-Fi 放不进 v0.1 裸机镜像的 16KB IRAM）。v0.5 平时是一张时钟 + 天气图标卡片，挥手播放 v0.1 的下压回弹动画并弹出椭圆气泡说一句话，第一次挥手后 1 到 10 秒内再挥一次查余额（不到 1 秒的算同一次）；有陪伴模式和生日模式，`http://pet.local/` 设置页，连不上 Wi-Fi 时自动开临时配网热点。气泡里是「大肥鱼」人设的句子：20 句内置种子 + 句子池，快用完时调一次 `deepseek-flash` 批量补 20 句（至少隔 12 小时，每天最多 4 次）。应用镜像在 `releases/v0.5/companion-v0.5.bin`，刷之前先做整片闪存备份，命令、引脚和说明都写在该目录的 README 里。注意 IDF 版本的屏幕 MOSI / DC 引脚是 GPIO9 / GPIO8，和上面 v0.1 的接线表不同。v0.1 的气泡和动画保持原样。

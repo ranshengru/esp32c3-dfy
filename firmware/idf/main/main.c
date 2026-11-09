@@ -1,74 +1,14 @@
 #include "display.h"
 #include "net.h"
-#include "sweep.h"
+#include "sonar.h"
 
 #include <stdio.h>
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
-enum { PIN_ECHO = 6, PIN_TRIG = 7 };
-
-static unsigned distance_mm(void)
-{
-    if (gpio_get_level(PIN_ECHO))
-        return 0;
-    gpio_set_level(PIN_TRIG, 1);
-    esp_rom_delay_us(12);
-    gpio_set_level(PIN_TRIG, 0);
-    int64_t start = esp_timer_get_time();
-    while (!gpio_get_level(PIN_ECHO)) {
-        if (esp_timer_get_time() - start > 30000)
-            return 0;
-    }
-    int64_t rise = esp_timer_get_time();
-    while (gpio_get_level(PIN_ECHO)) {
-        if (esp_timer_get_time() - rise > 30000)
-            return 0;
-    }
-    int64_t elapsed = esp_timer_get_time() - rise;
-    if (elapsed < 0)
-        return 0;
-    return (unsigned)((elapsed * 10) / 58);
-}
-
-static void sonar_init(void)
-{
-    gpio_config_t trig = {
-        .pin_bit_mask = 1ull << PIN_TRIG,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config_t echo = {
-        .pin_bit_mask = 1ull << PIN_ECHO,
-        .mode = GPIO_MODE_INPUT,
-    };
-    ESP_ERROR_CHECK(gpio_config(&trig));
-    ESP_ERROR_CHECK(gpio_config(&echo));
-    gpio_set_level(PIN_TRIG, 0);
-}
-
-static void sonar_task(void *arg)
-{
-    (void)arg;
-    sonar_init();
-    SweepGate gate = {0};
-    for (;;) {
-        unsigned mm = distance_mm();
-        if (mm < 20 || mm > 4000)
-            mm = 0;
-        uint32_t tick = (uint32_t)(esp_timer_get_time() * 16);
-        if (update_sweep(&gate, tick, mm)) {
-            ESP_LOGI("sonar", "sweep");
-            net_on_sweep();
-        }
-        vTaskDelay(pdMS_TO_TICKS(70));
-    }
-}
 
 static void console_task(void *arg)
 {
@@ -99,14 +39,88 @@ static void ui_task(void *arg)
     (void)arg;
     UiState previous;
     memset(&previous, 0xff, sizeof(previous));
+    uint32_t played = 0, fx_played = 0, blow_played = 0;
+    bool first = true;
+    int64_t last_party_draw = 0;
     for (;;) {
         UiState current;
         net_compose(&current);
+        if (first) {
+            played = current.anim_seq;
+            blow_played = current.blow_seq;
+            first = false;
+        }
+        int ms = display_fx_frame_ms();
+        if (current.party && current.blow_seq != blow_played) {
+            // Birthday sweep: candles flicker and go out, then fireworks + wish.
+            blow_played = current.blow_seq;
+            played = current.anim_seq;
+            fx_played = current.fx_seq;
+            int64_t start = esp_timer_get_time();
+            int frames = display_blow_frames() + display_fireworks_frames();
+            for (int frame = 0; frame < frames; ++frame) {
+                int64_t wait = start + (int64_t)frame * ms * 1000 - esp_timer_get_time();
+                if (wait > 1000)
+                    vTaskDelay(pdMS_TO_TICKS(wait / 1000));
+                if (frame == display_blow_frames())
+                    net_compose(&current); // wish bubble is ready by now
+                if (frame < display_blow_frames())
+                    display_party_frame(&current, PARTY_BLOW, frame, (uint32_t)frame);
+                else
+                    display_party_frame(&current, PARTY_FIREWORKS, frame - display_blow_frames(), (uint32_t)frame);
+            }
+            ESP_LOGI("ui", "blow + fireworks %d frames %lld ms", frames,
+                     (long long)((esp_timer_get_time() - start) / 1000));
+            previous = current;
+            continue;
+        }
+        if (current.party && current.fx_seq != fx_played) {
+            fx_played = current.fx_seq;
+            played = current.anim_seq;
+            int64_t start = esp_timer_get_time();
+            int frames = display_fireworks_frames();
+            for (int frame = 0; frame < frames; ++frame) {
+                int64_t wait = start + (int64_t)frame * ms * 1000 - esp_timer_get_time();
+                if (wait > 1000)
+                    vTaskDelay(pdMS_TO_TICKS(wait / 1000));
+                display_party_frame(&current, PARTY_SHOW, frame, (uint32_t)frame);
+            }
+            ESP_LOGI("ui", "fireworks %d frames %lld ms", frames, (long long)((esp_timer_get_time() - start) / 1000));
+            previous = current;
+            continue;
+        }
+        if (current.party)
+            played = current.anim_seq; // birthday sweeps use the candle animation
+        if (current.anim_seq != played) {
+            // v0.1 reaction: two quick squash-and-rebounds under a still bubble.
+            played = current.anim_seq;
+            int64_t start = esp_timer_get_time();
+            int frames = display_anim_frames();
+            for (int frame = 0; frame < frames; ++frame) {
+                int64_t due = start + (int64_t)frame * 33333;
+                int64_t wait = due - esp_timer_get_time();
+                if (wait > 1000)
+                    vTaskDelay(pdMS_TO_TICKS(wait / 1000));
+                display_anim_frame(&current, frame);
+            }
+            ESP_LOGI("ui", "motion done %d frames %lld ms", frames,
+                     (long long)((esp_timer_get_time() - start) / 1000));
+            previous = current;
+            continue;
+        }
+        if (current.party && esp_timer_get_time() - last_party_draw > 150000) {
+            // Candle flicker on the birthday screen.
+            display_show(&current);
+            last_party_draw = esp_timer_get_time();
+            previous = current;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
         if (memcmp(&current, &previous, sizeof(current))) {
             display_show(&current);
             previous = current;
         }
-        vTaskDelay(pdMS_TO_TICKS(250));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -116,6 +130,6 @@ void app_main(void)
     display_init();
     net_init();
     xTaskCreate(ui_task, "ui", 6144, 0, 4, 0);
-    xTaskCreate(sonar_task, "sonar", 3072, 0, 3, 0);
+    sonar_start();
     xTaskCreate(console_task, "console", 4096, 0, 3, 0);
 }

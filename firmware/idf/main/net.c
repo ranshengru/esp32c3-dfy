@@ -1,6 +1,9 @@
+// Screen lines are truncated on purpose; the panel only fits about 7 hanzi.
+#pragma GCC diagnostic ignored "-Wformat-truncation"
 #include "net.h"
 #include "portal.h"
 #include "quotes.h"
+#include "sonar.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,12 +15,14 @@
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -27,6 +32,13 @@
 static const char *TAG = "net";
 static const char *NVS_NS = "pet";
 static const char *BALANCE_URL = "https://api.deepseek.com/user/balance";
+// Cheapest DeepSeek model from GET /models (2026-11): "deepseek-flash" (DeepSeek-V4.1-Flash).
+// Thinking is disabled so the 24-token budget goes to the answer.
+#define LLM_MODEL "deepseek-flash"
+enum { LLM_DAILY_CAP = 4 };
+static const int64_t AP_FAIL_US = 3LL * 60 * 1000000LL;      // STA down this long -> setup hotspot
+static const int64_t AP_LIFETIME_US = 10LL * 60 * 1000000LL; // hotspot auto-off when nobody joined
+static const int64_t AP_REARM_US = 5LL * 60 * 1000000LL;     // pause before the hotspot may come back
 
 static SemaphoreHandle_t mu;
 static TaskHandle_t net_task_handle;
@@ -49,7 +61,7 @@ static int64_t g_last_fetch_us;
 static int64_t g_retry_at_us;
 static char g_city[32];
 static char g_weather[24];
-static char g_phrase[40];
+static char g_phrase[96];
 static char g_remind[40];
 static int g_lat_e6;
 static int g_lon_e6;
@@ -69,10 +81,47 @@ static int64_t g_last_move_us;
 static int64_t g_next_weather_us;
 static int64_t g_arm_us;
 static bool g_arm_double;
-static char g_api_line[32];
-static bool g_quote_pending;
-static int64_t g_next_quote_us;
+static bool g_refill_pending;
 static wifi_ap_record_t g_scan_records[24];
+
+// v0.5 state
+static bool g_geo_fixed;          // coordinates typed by the user, skip geocoding
+static int g_mode;                // 0 companion, 1 birthday
+static char g_bname[32];
+static int g_bmonth;
+static int g_bday;
+static bool g_bauto = true;
+static char g_msg[40];
+static bool g_rpause;
+static int g_llm_day = -1;
+static int g_llm_count;
+static int64_t g_ip_until_us;
+static char g_wx_today[24];
+static char g_wx_tomorrow[24];
+static bool g_ap_active;
+static bool g_ap_want_off;
+static char g_ap_ssid[24];
+static char g_ap_pass[12];
+static int g_ap_clients;
+static int64_t g_ap_until_us;
+static int64_t g_ap_next_ok_us;
+static int64_t g_sta_down_since_us;
+static bool g_ap_request;
+static bool g_ap_stop_request;
+static uint32_t g_anim_seq;
+static int g_wcode = -1;
+static int g_temp_c;
+static bool g_balance_bubble;
+
+static uint16_t g_wish_used; // shuffle bag over BIRTHDAY_WISHES
+static uint32_t g_fx_seq;      // fireworks
+static uint32_t g_blow_seq;    // blow out candles
+static int64_t g_candles_out_until_us;
+static int64_t g_last_fx_us;
+static bool g_was_party;
+static int64_t g_demo_until_us; // BDAYDEMO: birthday visuals without the date
+static int g_wish_last = -1;
+static const char *const WEEKDAYS[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
 
 static void label(const char *text)
 {
@@ -216,7 +265,14 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     (void)arg;
     bool kick = false;
     xSemaphoreTake(mu, portMAX_DELAY);
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
+        ++g_ap_clients;
+        ESP_LOGI(TAG, "setup hotspot client joined (%d)", g_ap_clients);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        if (g_ap_clients > 0)
+            --g_ap_clients;
+        ESP_LOGI(TAG, "setup hotspot client left (%d)", g_ap_clients);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         if (g_ssid[0]) {
             label("连接中");
             kick = true;
@@ -227,6 +283,8 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         const wifi_event_sta_disconnected_t *event = data;
         g_connected = false;
         g_ip[0] = 0;
+        if (!g_sta_down_since_us)
+            g_sta_down_since_us = esp_timer_get_time();
         int64_t delay_us = 0;
         if (event->reason == WIFI_REASON_ASSOC_LEAVE) {
             ESP_LOGI(TAG, "wifi left");
@@ -251,6 +309,12 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         g_retry_at_us = 0;
         snprintf(g_ip, sizeof(g_ip), IPSTR, IP2STR(&event->ip_info.ip));
         label("已连接");
+        g_sta_down_since_us = 0;
+        g_ip_until_us = esp_timer_get_time() + 30 * 1000000LL;
+        if (g_ap_active)
+            g_ap_want_off = true; // keep it a minute so the phone sees the result
+        if (g_ap_active)
+            g_ap_until_us = esp_timer_get_time() + 60 * 1000000LL;
         g_fetch_pending = true;
         g_last_fetch_us = esp_timer_get_time();
         g_next_weather_us = 0;
@@ -282,7 +346,7 @@ static void ensure_sntp(void)
     started = true;
 }
 
-static char body[3072];
+static char body[6144];
 static int body_len;
 
 static esp_err_t http_event(esp_http_client_event_t *event)
@@ -357,83 +421,242 @@ static bool utf8_next(const unsigned char **text, uint32_t *codepoint)
     return false;
 }
 
-static bool junk_codepoint(uint32_t codepoint)
+// ---- sentence pool ---------------------------------------------------------
+// 20 built-in seed lines (quotes.h) plus up to POOL_GEN_MAX lines generated in
+// rare DeepSeek batches. Shuffle bag: a line is not repeated until every
+// eligible line has been shown once this round, and never one of the last
+// POOL_RECENT lines. Lines shown POOL_RETIRE times retire (generated ones are
+// deleted to make room). When fewer than 20% of active lines are unshown this
+// round, one batch refill is queued (still bound by the 12 h spacing and the
+// 4-calls-a-day cap in llm_take_slot). Everything persists in one NVS blob.
+
+enum {
+    POOL_GEN_MAX = 40,
+    POOL_TEXT = 72,
+    POOL_RETIRE = 5,
+    POOL_RECENT = 6,
+    POOL_LOW_PCT = 20,
+    POOL_BATCH = 20,
+    POOL_RETIRED = 255,
+    POOL_VERSION = 1,
+};
+
+typedef struct {
+    uint8_t tag;
+    uint8_t shows;
+    uint8_t used;
+    uint8_t pad;
+    char text[POOL_TEXT];
+} GenLine;
+
+typedef struct {
+    uint8_t version;
+    uint8_t builtin_count;
+    uint8_t bshows[PET_QUOTE_COUNT];
+    uint8_t bused[PET_QUOTE_COUNT];
+    GenLine gen[POOL_GEN_MAX];
+} PoolStore;
+
+static PoolStore g_pool;
+static int g_recent[POOL_RECENT] = {-1, -1, -1, -1, -1, -1};
+static int g_recent_pos;
+static bool g_pool_dirty;
+static int64_t g_pool_saved_us;
+static int g_pool_refills;
+static bool g_refill_force;
+
+static void pool_load(void)
 {
-    if (codepoint <= 32)
-        return true;
-    switch (codepoint) {
-    case '"':
-    case '\'':
-    case '(':
-    case ')':
-    case '~':
-    case 0x3002:
-    case 0xff0c:
-    case 0xff01:
-    case 0xff1f:
-    case 0x3001:
-    case 0x2026:
-    case 0x201c:
-    case 0x201d:
-    case 0x2018:
-    case 0x2019:
-    case 0xff08:
-    case 0xff09:
-    case 0xff5e:
-        return true;
-    default:
-        return false;
+    memset(&g_pool, 0, sizeof(g_pool));
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS, NVS_READONLY, &handle) == ESP_OK) {
+        size_t length = sizeof(g_pool);
+        if (nvs_get_blob(handle, "pool", &g_pool, &length) != ESP_OK || length != sizeof(g_pool) ||
+            g_pool.version != POOL_VERSION)
+            memset(&g_pool, 0, sizeof(g_pool));
+        nvs_close(handle);
     }
+    if (g_pool.builtin_count != PET_QUOTE_COUNT) {
+        // Seed list changed in firmware: restart its counters, keep generated lines.
+        memset(g_pool.bshows, 0, sizeof(g_pool.bshows));
+        memset(g_pool.bused, 0, sizeof(g_pool.bused));
+    }
+    g_pool.version = POOL_VERSION;
+    g_pool.builtin_count = PET_QUOTE_COUNT;
+    for (int i = 0; i < POOL_GEN_MAX; ++i)
+        g_pool.gen[i].text[POOL_TEXT - 1] = 0;
 }
 
-static void clean_quote(char *text)
+static void pool_save(void)
 {
-    char cleaned[32];
-    int used = 0;
-    const unsigned char *cursor = (const unsigned char *)text;
-    uint32_t codepoint;
-    while (utf8_next(&cursor, &codepoint)) {
-        if (junk_codepoint(codepoint))
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &handle) != ESP_OK)
+        return;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    esp_err_t err = nvs_set_blob(handle, "pool", &g_pool, sizeof(g_pool));
+    g_pool_dirty = false;
+    xSemaphoreGive(mu);
+    if (err == ESP_OK)
+        nvs_commit(handle);
+    nvs_close(handle);
+    g_pool_saved_us = esp_timer_get_time();
+}
+
+// Counters change on every sweep; write them at most every 2 minutes.
+static void pool_flush_if_due(void)
+{
+    if (g_pool_dirty && esp_timer_get_time() - g_pool_saved_us > 120 * 1000000LL)
+        pool_save();
+}
+
+static bool pool_active(int id)
+{
+    if (id < PET_QUOTE_COUNT)
+        return g_pool.bshows[id] != POOL_RETIRED;
+    return g_pool.gen[id - PET_QUOTE_COUNT].text[0] != 0;
+}
+
+static const char *pool_text(int id)
+{
+    return id < PET_QUOTE_COUNT ? PET_QUOTES[id].text : g_pool.gen[id - PET_QUOTE_COUNT].text;
+}
+
+static int pool_tag(int id)
+{
+    return id < PET_QUOTE_COUNT ? PET_QUOTES[id].tag : g_pool.gen[id - PET_QUOTE_COUNT].tag;
+}
+
+static uint8_t *pool_used(int id)
+{
+    return id < PET_QUOTE_COUNT ? &g_pool.bused[id] : &g_pool.gen[id - PET_QUOTE_COUNT].used;
+}
+
+static void pool_counts_locked(int *active, int *unused, int *generated)
+{
+    *active = *unused = *generated = 0;
+    for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id) {
+        if (!pool_active(id))
             continue;
-        int bytes = codepoint < 0x80 ? 1 : codepoint < 0x800 ? 2 : 3;
-        if (used + bytes >= (int)sizeof(cleaned))
-            break;
-        if (codepoint < 0x80) {
-            cleaned[used++] = (char)codepoint;
-        } else if (codepoint < 0x800) {
-            cleaned[used++] = (char)(0xc0 | (codepoint >> 6));
-            cleaned[used++] = (char)(0x80 | (codepoint & 0x3f));
-        } else {
-            cleaned[used++] = (char)(0xe0 | (codepoint >> 12));
-            cleaned[used++] = (char)(0x80 | ((codepoint >> 6) & 0x3f));
-            cleaned[used++] = (char)(0x80 | (codepoint & 0x3f));
-        }
+        ++*active;
+        if (!*pool_used(id))
+            ++*unused;
+        if (id >= PET_QUOTE_COUNT)
+            ++*generated;
     }
-    cleaned[used] = 0;
-    snprintf(text, 32, "%s", cleaned);
 }
 
-static bool quote_ok(const char *text)
+static int time_tag(int hour)
 {
-    const unsigned char *cursor = (const unsigned char *)text;
-    uint32_t codepoint;
-    int count = 0;
-    while (utf8_next(&cursor, &codepoint)) {
-        if (junk_codepoint(codepoint) || codepoint > 0xffff || !display_has_glyph(codepoint))
-            return false;
-        if (++count > 7)
-            return false;
+    if (hour >= 5 && hour <= 10)
+        return Q_MORNING;
+    if (hour >= 11 && hour <= 13)
+        return Q_NOON;
+    if (hour >= 17 && hour <= 21)
+        return Q_EVENING;
+    if (hour >= 22 || hour <= 4)
+        return Q_NIGHT;
+    return Q_ANY;
+}
+
+static int weather_tag_locked(void)
+{
+    if (g_wcode < 0)
+        return Q_ANY;
+    bool snow = (g_wcode >= 71 && g_wcode <= 77) || g_wcode == 85 || g_wcode == 86;
+    if (g_wcode >= 51 && !snow)
+        return Q_RAIN;
+    if (g_temp_c >= 30)
+        return Q_HOT;
+    if (g_temp_c <= 8)
+        return Q_COLD;
+    return Q_ANY;
+}
+
+static bool pool_recent(int id)
+{
+    for (int i = 0; i < POOL_RECENT; ++i)
+        if (g_recent[i] == id)
+            return true;
+    return false;
+}
+
+static bool pool_eligible(int id, int ttag, int wtag)
+{
+    if (!pool_active(id))
+        return false;
+    int tag = pool_tag(id);
+    return tag == Q_ANY || tag == ttag || tag == wtag;
+}
+
+static int pool_choose_locked(int ttag, int wtag, bool need_unused)
+{
+    int chosen = -1, seen = 0;
+    for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id) {
+        if (!pool_eligible(id, ttag, wtag) || pool_recent(id) || (need_unused && *pool_used(id)))
+            continue;
+        if (esp_random() % (uint32_t)++seen == 0)
+            chosen = id;
     }
-    return count >= 4;
+    return chosen;
 }
 
 static void show_phrase_locked(void)
 {
-    const char *line = PET_QUOTES[esp_random() % PET_QUOTE_COUNT];
-    if (g_api_line[0] && (esp_random() % 5) == 0)
-        line = g_api_line;
-    snprintf(g_phrase, sizeof(g_phrase), "%s", line);
-    g_phrase_until_us = esp_timer_get_time() + 8 * 1000000LL;
+    int hour = -1;
+    if (time_ready()) {
+        time_t wall = time(NULL);
+        struct tm local;
+        localtime_r(&wall, &local);
+        hour = local.tm_hour;
+    }
+    int ttag = hour < 0 ? Q_ANY : time_tag(hour);
+    int wtag = weather_tag_locked();
+    int id = pool_choose_locked(ttag, wtag, true);
+    if (id < 0) {
+        // Every eligible line was shown this round: start a new round for them.
+        for (int k = 0; k < PET_QUOTE_COUNT + POOL_GEN_MAX; ++k)
+            if (pool_eligible(k, ttag, wtag))
+                *pool_used(k) = 0;
+        id = pool_choose_locked(ttag, wtag, true);
+    }
+    if (id < 0)
+        id = pool_choose_locked(ttag, wtag, false);
+    if (id < 0) {
+        // Pool nearly empty (everything retired): bring the seed lines back.
+        memset(g_pool.bshows, 0, sizeof(g_pool.bshows));
+        memset(g_pool.bused, 0, sizeof(g_pool.bused));
+        id = pool_choose_locked(Q_ANY, Q_ANY, false);
+    }
+    if (id < 0)
+        id = 0;
+    snprintf(g_phrase, sizeof(g_phrase), "%s", pool_text(id));
+    g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
+    *pool_used(id) = 1;
+    g_recent[g_recent_pos] = id;
+    g_recent_pos = (g_recent_pos + 1) % POOL_RECENT;
+    uint8_t *shows = id < PET_QUOTE_COUNT ? &g_pool.bshows[id] : &g_pool.gen[id - PET_QUOTE_COUNT].shows;
+    if (*shows < POOL_RETIRE)
+        ++*shows;
+    printf("QUOTE #%d %s shows %d tag %d\n", id, g_phrase, *shows, pool_tag(id));
+    if (*shows >= POOL_RETIRE) {
+        if (id < PET_QUOTE_COUNT) {
+            g_pool.bshows[id] = POOL_RETIRED;
+        } else {
+            g_pool.gen[id - PET_QUOTE_COUNT].text[0] = 0;
+        }
+        printf("QUOTE #%d retired after %d shows\n", id, POOL_RETIRE);
+    }
+    int active, unused, generated;
+    pool_counts_locked(&active, &unused, &generated);
+    if (active < 8) {
+        memset(g_pool.bshows, 0, sizeof(g_pool.bshows));
+        pool_counts_locked(&active, &unused, &generated);
+    }
+    g_pool_dirty = true;
+    if (unused * 100 < active * POOL_LOW_PCT && g_key[0] && g_available && !g_refill_pending) {
+        g_refill_pending = true;
+        printf("POOL low: %d/%d unshown, batch refill queued\n", unused, active);
+    }
 }
 
 static void dismiss_locked(void)
@@ -484,7 +707,16 @@ static void check_reminders(void)
         g_remind[0] = 0;
         g_remind_kind = 0;
     }
-    if (!g_remind[0] && !in_quiet(local.tm_hour)) {
+    if (g_rpause && g_remind[0]) {
+        g_remind[0] = 0;
+        g_remind_kind = 0;
+    }
+    if (g_rpause) {
+        // Paused: keep the timers fresh so nothing fires the moment it resumes.
+        g_last_drink_us = now;
+        g_last_move_us = now;
+    }
+    if (!g_rpause && !g_remind[0] && !in_quiet(local.tm_hour)) {
         if (g_drink_min > 0 && g_last_drink_us &&
             now - g_last_drink_us >= (int64_t)g_drink_min * 60 * 1000000LL) {
             snprintf(g_remind, sizeof(g_remind), "该喝水了");
@@ -558,10 +790,20 @@ static void fetch_balance(const char *key)
                 snprintf(g_currency, sizeof(g_currency), "%s", currency->valuestring);
             g_available = cJSON_IsTrue(available);
             detail(g_available ? "" : "不可用");
+            if (g_balance_bubble) {
+                snprintf(g_phrase, sizeof(g_phrase), "余额\n%s%s", g_total, strcmp(g_currency, "CNY") ? g_currency : "元");
+                g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
+            }
             ESP_LOGI(TAG, "balance %s %s available=%d", g_currency, g_total, g_available);
         }
         cJSON_Delete(root);
     }
+    if (g_balance_bubble && !strcmp(g_phrase, "查余额中")) {
+        // Failed: show why instead of a stale "querying".
+        snprintf(g_phrase, sizeof(g_phrase), "%s", g_detail[0] ? g_detail : "查询失败");
+        g_phrase_until_us = esp_timer_get_time() + 6 * 1000000LL;
+    }
+    g_balance_bubble = false;
     xSemaphoreGive(mu);
 }
 
@@ -618,6 +860,25 @@ static const char *weather_name(int code)
     return "未知";
 }
 
+static int weather_icon(int code)
+{
+    if (code < 0)
+        return ICON_NONE;
+    if (code == 0)
+        return ICON_SUN;
+    if (code <= 2)
+        return ICON_PARTLY;
+    if (code == 3)
+        return ICON_CLOUD;
+    if (code == 45 || code == 48)
+        return ICON_FOG;
+    if ((code >= 71 && code <= 77) || code == 85 || code == 86)
+        return ICON_SNOW;
+    if (code >= 95)
+        return ICON_THUNDER;
+    return ICON_RAIN;
+}
+
 static void set_weather(const char *text)
 {
     xSemaphoreTake(mu, portMAX_DELAY);
@@ -637,7 +898,7 @@ static void fetch_weather(void)
     lat_e6 = g_lat_e6;
     lon_e6 = g_lon_e6;
     tz = g_tz_hours;
-    has_geo = g_has_geo;
+    has_geo = g_has_geo || g_geo_fixed;
     xSemaphoreGive(mu);
     int64_t delay = 10LL * 60 * 1000000LL;
     if (!city[0])
@@ -700,8 +961,16 @@ static void fetch_weather(void)
             int rounded = (int)(value + (value >= 0 ? 0.5 : -0.5));
             int wcode = (int)(code->valuedouble + (code->valuedouble >= 0 ? 0.5 : -0.5));
             char line[24];
-            snprintf(line, sizeof(line), "%s %d度", weather_name(wcode), rounded);
+            snprintf(line, sizeof(line), "%d°C %s", rounded, weather_name(wcode));
             set_weather(line);
+            xSemaphoreTake(mu, portMAX_DELAY);
+            g_wcode = wcode;
+            g_temp_c = rounded;
+            xSemaphoreGive(mu);
+            xSemaphoreTake(mu, portMAX_DELAY);
+            g_wx_today[0] = 0;
+            g_wx_tomorrow[0] = 0;
+            xSemaphoreGive(mu);
             delay = 30LL * 60 * 1000000LL;
             ESP_LOGI(TAG, "weather %s", line);
         }
@@ -712,49 +981,360 @@ static void fetch_weather(void)
     xSemaphoreGive(mu);
 }
 
-static void fetch_quote(const char *key)
+static int llm_day_stamp(void)
 {
-    static const char *payload =
-        "{\"model\":\"deepseek-chat\",\"temperature\":1.2,\"max_tokens\":24,"
-        "\"messages\":[{\"role\":\"system\",\"content\":"
-        "\"你是桌宠大肥鱼，圆、懒、贪吃、黏人。只回一句中文，4到7个字，不要标点不要引号不要表情。\"},"
-        "{\"role\":\"user\",\"content\":\"说一句\"}]}";
-    int status = https_call("https://api.deepseek.com/chat/completions", key, payload);
-    int64_t delay = 60LL * 60 * 1000000LL;
+    time_t wall = time(NULL);
+    struct tm local;
+    localtime_r(&wall, &local);
+    return (local.tm_year + 1900) * 1000 + local.tm_yday;
+}
+
+// Daily cap, persisted so reboots cannot reset it. Returns false when spent.
+static bool llm_take_slot(bool ignore_spacing)
+{
+    // 12 h spacing also survives reboots: last attempt time is kept in NVS.
+    char last_text[16] = {0};
+    nvs_load("llmt", last_text, sizeof(last_text));
+    long long last = last_text[0] ? atoll(last_text) : 0;
+    long long wall = (long long)time(NULL);
+    if (!ignore_spacing && last && wall >= last && wall - last < 12LL * 3600)
+        return false;
+    int stamp = llm_day_stamp();
+    bool ok;
+    int count;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    if (stamp != g_llm_day) {
+        g_llm_day = stamp;
+        g_llm_count = 0;
+    }
+    ok = g_llm_count < LLM_DAILY_CAP;
+    if (ok)
+        ++g_llm_count;
+    count = g_llm_count;
+    xSemaphoreGive(mu);
+    if (ok) {
+        char wall_text[16];
+        snprintf(wall_text, sizeof(wall_text), "%lld", wall);
+        nvs_put("llmt", wall_text);
+        save_int("llmd", stamp);
+        save_int("llmn", count);
+    }
+    return ok;
+}
+
+static void utf8_put(char *out, int *used, int size, uint32_t c)
+{
+    int bytes = c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+    if (*used + bytes >= size)
+        return;
+    if (c < 0x80) {
+        out[(*used)++] = (char)c;
+    } else if (c < 0x800) {
+        out[(*used)++] = (char)(0xc0 | (c >> 6));
+        out[(*used)++] = (char)(0x80 | (c & 0x3f));
+    } else {
+        out[(*used)++] = (char)(0xe0 | (c >> 12));
+        out[(*used)++] = (char)(0x80 | ((c >> 6) & 0x3f));
+        out[(*used)++] = (char)(0x80 | (c & 0x3f));
+    }
+}
+
+// Cleans a generated line in place; false when it must be rejected.
+static bool pool_line_ok(char *text)
+{
+    static const char *const banned[] = {"政", "党", "主席", "国家", "币", "股", "投资", "理财", "色情", "性感",
+                                         "赌", "毒", "枪", "广告", "http", "AI", "模型"};
+    char clean[POOL_TEXT];
+    int used = 0, count = 0;
+    const unsigned char *cursor = (const unsigned char *)text;
+    uint32_t c;
+    while (*cursor) {
+        if (!utf8_next(&cursor, &c))
+            return false;
+        if (c >= 0x300 && c <= 0x36f)
+            continue; // combining marks (e.g. in •̀) have no glyph
+        if (c < 32 || c > 0xffff || c == '"' || c == '\\')
+            return false;
+        if (c == ' ' && (used == 0 || clean[used - 1] == ' '))
+            continue;
+        utf8_put(clean, &used, sizeof(clean), c);
+        ++count;
+        if (used >= POOL_TEXT - 4)
+            return false;
+    }
+    while (used && clean[used - 1] == ' ')
+        --used;
+    clean[used] = 0;
+    if (count < 4)
+        return false;
+    for (unsigned i = 0; i < sizeof(banned) / sizeof(banned[0]); ++i)
+        if (strstr(clean, banned[i]))
+            return false;
+    if (!display_bubble_fits(clean))
+        return false; // needs more than two bubble lines, or unknown glyphs
+    strcpy(text, clean);
+    return true;
+}
+
+static int pool_tag_from(const char *t)
+{
+    switch (t && t[0] ? t[0] : 'a') {
+    case 'm': return Q_MORNING;
+    case 'n': return Q_NOON;
+    case 'e': return Q_EVENING;
+    case 'x': return Q_NIGHT;
+    case 'r': return Q_RAIN;
+    case 'h': return Q_HOT;
+    case 'c': return Q_COLD;
+    default: return Q_ANY;
+    }
+}
+
+static bool pool_has_locked(const char *text)
+{
+    for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id)
+        if ((id < PET_QUOTE_COUNT || pool_active(id)) && !strcmp(pool_text(id), text))
+            return true;
+    return false;
+}
+
+// Free slot for a new generated line: empty first, else the most-shown one
+// that has already been seen this round.
+static int pool_free_slot_locked(void)
+{
+    int best = -1, best_shows = 0;
+    for (int i = 0; i < POOL_GEN_MAX; ++i) {
+        GenLine *g = &g_pool.gen[i];
+        if (!g->text[0])
+            return i;
+        if (g->used && g->shows >= 2 && g->shows > best_shows) {
+            best = i;
+            best_shows = g->shows;
+        }
+    }
+    return best;
+}
+
+static void pool_refill(const char *key)
+{
+    bool force;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    force = g_refill_force;
+    g_refill_force = false;
+    xSemaphoreGive(mu);
+    if (!llm_take_slot(force)) {
+        ESP_LOGI(TAG, "pool refill skipped: 12 h spacing or daily cap %d", LLM_DAILY_CAP);
+        xSemaphoreTake(mu, portMAX_DELAY);
+        g_refill_pending = false;
+        xSemaphoreGive(mu);
+        return;
+    }
+    // Lines to avoid: recently shown plus a few stored ones.
+    char *avoid = malloc(800);
+    char *ask = malloc(1400);
+    cJSON *root = cJSON_CreateObject();
+    if (!avoid || !ask || !root) {
+        free(avoid);
+        free(ask);
+        cJSON_Delete(root);
+        xSemaphoreTake(mu, portMAX_DELAY);
+        g_refill_pending = false;
+        xSemaphoreGive(mu);
+        return;
+    }
+    int alen = 0;
+    avoid[0] = 0;
+    char context[48];
+    xSemaphoreTake(mu, portMAX_DELAY);
+    for (int i = 0; i < POOL_RECENT; ++i)
+        if (g_recent[i] >= 0 && pool_active(g_recent[i]) && alen < 700)
+            alen += snprintf(avoid + alen, 800 - alen, "%s；", pool_text(g_recent[i]));
+    for (int i = 0; i < POOL_GEN_MAX && alen < 700; ++i)
+        if (g_pool.gen[i].text[0] && (esp_random() % 3) == 0)
+            alen += snprintf(avoid + alen, 800 - alen, "%s；", g_pool.gen[i].text);
+    snprintf(context, sizeof(context), "%s", g_weather[0] ? g_weather : "未知");
+    xSemaphoreGive(mu);
+    snprintf(ask, 1400,
+             "请生成%d句不同的话，只输出json：{\"l\":[[\"标签\",\"句子\"],...]}。"
+             "标签用一个字母：a通用 m早上 n中午 e晚上 x深夜 r下雨 h炎热 c寒冷；约一半用a，其余各类都要有。"
+             "每句不超过16个字，用逗号分成两个各不超过8个字的短句，必须能放进两行小字气泡；最多3句带颜文字。现在天气：%s。"
+             "不要和这些重复或太像：%s",
+             POOL_BATCH, context, avoid[0] ? avoid : "无");
+    cJSON_AddStringToObject(root, "model", LLM_MODEL);
+    cJSON *thinking = cJSON_AddObjectToObject(root, "thinking");
+    cJSON_AddStringToObject(thinking, "type", "disabled");
+    cJSON_AddNumberToObject(root, "temperature", 1.3);
+    cJSON_AddNumberToObject(root, "max_tokens", 1200);
+    cJSON *format = cJSON_AddObjectToObject(root, "response_format");
+    cJSON_AddStringToObject(format, "type", "json_object");
+    cJSON *messages = cJSON_AddArrayToObject(root, "messages");
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role", "system");
+    cJSON_AddStringToObject(sys, "content", PET_PERSONA);
+    cJSON_AddItemToArray(messages, sys);
+    cJSON *user = cJSON_CreateObject();
+    cJSON_AddStringToObject(user, "role", "user");
+    cJSON_AddStringToObject(user, "content", ask);
+    cJSON_AddItemToArray(messages, user);
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    free(avoid);
+    free(ask);
+    int status = payload ? https_call("https://api.deepseek.com/chat/completions", key, payload) : -1;
+    free(payload);
+    int added = 0, rejected = 0;
     if (status == 200) {
-        cJSON *root = cJSON_ParseWithLength(body, (size_t)body_len);
-        cJSON *choices = root ? cJSON_GetObjectItem(root, "choices") : 0;
+        cJSON *resp = cJSON_ParseWithLength(body, (size_t)body_len);
+        cJSON *choices = resp ? cJSON_GetObjectItem(resp, "choices") : 0;
         cJSON *first = cJSON_GetArrayItem(choices, 0);
         cJSON *message = first ? cJSON_GetObjectItem(first, "message") : 0;
         cJSON *content = message ? cJSON_GetObjectItem(message, "content") : 0;
-        char line[32] = {0};
-        if (cJSON_IsString(content))
-            snprintf(line, sizeof(line), "%s", content->valuestring);
-        cJSON_Delete(root);
-        clean_quote(line);
-        if (quote_ok(line)) {
-            delay = 6LL * 3600 * 1000000LL;
+        cJSON *batch = cJSON_IsString(content) ? cJSON_Parse(content->valuestring) : 0;
+        cJSON_Delete(resp);
+        cJSON *list = batch ? cJSON_GetObjectItem(batch, "l") : 0;
+        cJSON *item;
+        cJSON_ArrayForEach(item, list)
+        {
+            const char *tag = 0, *text = 0;
+            if (cJSON_IsArray(item)) {
+                cJSON *t = cJSON_GetArrayItem(item, 0), *s = cJSON_GetArrayItem(item, 1);
+                tag = cJSON_IsString(t) ? t->valuestring : 0;
+                text = cJSON_IsString(s) ? s->valuestring : 0;
+            } else if (cJSON_IsString(item)) {
+                text = item->valuestring;
+            }
+            char line[POOL_TEXT * 2];
+            if (!text || strlen(text) >= sizeof(line)) {
+                ++rejected;
+                continue;
+            }
+            strcpy(line, text);
+            if (!pool_line_ok(line)) {
+                printf("POOL reject: %s\n", text);
+                ++rejected;
+                continue;
+            }
             xSemaphoreTake(mu, portMAX_DELAY);
-            snprintf(g_api_line, sizeof(g_api_line), "%s", line);
-            snprintf(g_phrase, sizeof(g_phrase), "%s", line);
-            g_phrase_until_us = esp_timer_get_time() + 8 * 1000000LL;
+            int slot = pool_has_locked(line) ? -2 : pool_free_slot_locked();
+            if (slot >= 0) {
+                GenLine *g = &g_pool.gen[slot];
+                memset(g, 0, sizeof(*g));
+                g->tag = (uint8_t)pool_tag_from(tag);
+                snprintf(g->text, sizeof(g->text), "%s", line);
+                ++added;
+            }
             xSemaphoreGive(mu);
-            nvs_put("line", line);
-            ESP_LOGI(TAG, "quote %s", line);
-        } else {
-            ESP_LOGI(TAG, "quote rejected");
+            if (slot == -2)
+                ++rejected;
+            if (slot >= 0)
+                printf("POOL add [%s] %s\n", tag ? tag : "a", line);
         }
+        cJSON_Delete(batch);
     } else if (status == 401 || status == 402) {
         xSemaphoreTake(mu, portMAX_DELAY);
         g_available = false;
         detail(status == 401 ? "密钥无效" : "不可用");
         xSemaphoreGive(mu);
-        delay = 6LL * 3600 * 1000000LL;
     }
     xSemaphoreTake(mu, portMAX_DELAY);
-    g_quote_pending = false;
-    g_next_quote_us = esp_timer_get_time() + delay;
+    g_refill_pending = false;
+    if (added)
+        ++g_pool_refills;
+    g_pool_dirty = true;
     xSemaphoreGive(mu);
+    pool_save();
+    ESP_LOGI(TAG, "pool refill http %d added %d rejected %d", status, added, rejected);
+}
+
+// On-demand WPA2 setup hotspot. Only while there is no working home Wi-Fi:
+// a permanent AP+STA shares one radio and is forced onto the router's channel.
+static void ap_start(void)
+{
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    char ssid[24];
+    char pass[12];
+    snprintf(ssid, sizeof(ssid), "Pet-Setup-%02X%02X", mac[4], mac[5]);
+    snprintf(pass, sizeof(pass), "%08lu", (unsigned long)(esp_random() % 100000000UL));
+    wifi_config_t ap;
+    memset(&ap, 0, sizeof(ap));
+    memcpy(ap.ap.ssid, ssid, strlen(ssid));
+    ap.ap.ssid_len = (uint8_t)strlen(ssid);
+    memcpy(ap.ap.password, pass, strlen(pass));
+    ap.ap.channel = 6;
+    ap.ap.max_connection = 2;
+    ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap.ap.pmf_cfg.required = false;
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err == ESP_OK)
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "setup hotspot failed: %s", esp_err_to_name(err));
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        xSemaphoreTake(mu, portMAX_DELAY);
+        g_ap_next_ok_us = esp_timer_get_time() + AP_REARM_US;
+        xSemaphoreGive(mu);
+        return;
+    }
+    xSemaphoreTake(mu, portMAX_DELAY);
+    g_ap_active = true;
+    g_ap_want_off = false;
+    g_ap_clients = 0;
+    g_ap_until_us = esp_timer_get_time() + AP_LIFETIME_US;
+    snprintf(g_ap_ssid, sizeof(g_ap_ssid), "%s", ssid);
+    snprintf(g_ap_pass, sizeof(g_ap_pass), "%s", pass);
+    xSemaphoreGive(mu);
+    // The password is temporary and also shown on the screen.
+    printf("setup hotspot on: %s password %s http://192.168.4.1/ (auto-off in 10 min)\n", ssid, pass);
+    fflush(stdout);
+}
+
+static void ap_stop(void)
+{
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    xSemaphoreTake(mu, portMAX_DELAY);
+    g_ap_active = false;
+    g_ap_want_off = false;
+    g_ap_clients = 0;
+    g_ap_pass[0] = 0;
+    g_ap_next_ok_us = esp_timer_get_time() + AP_REARM_US;
+    if (!g_connected && g_ssid[0]) {
+        g_sta_down_since_us = esp_timer_get_time();
+        g_retry_at_us = esp_timer_get_time() + 500000;
+    }
+    xSemaphoreGive(mu);
+    printf("setup hotspot off\n");
+    fflush(stdout);
+}
+
+static void ap_tick(void)
+{
+    int64_t now = esp_timer_get_time();
+    bool start = false;
+    bool stop = false;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    if (g_ap_active) {
+        if (g_ap_stop_request)
+            stop = true;
+        else if (now >= g_ap_until_us && (g_ap_want_off || g_ap_clients == 0))
+            stop = true;
+        else if (now >= g_ap_until_us)
+            g_ap_until_us = now + 2LL * 60 * 1000000LL; // someone is still on it
+    } else if (g_ap_request) {
+        start = true;
+    } else if (!g_connected && !g_scan_in_progress && now >= g_ap_next_ok_us && now > 5000000) {
+        if (!g_ssid[0])
+            start = true;
+        else if (g_sta_down_since_us && now - g_sta_down_since_us >= AP_FAIL_US)
+            start = true;
+    }
+    g_ap_request = false;
+    g_ap_stop_request = false;
+    xSemaphoreGive(mu);
+    if (start)
+        ap_start();
+    else if (stop)
+        ap_stop();
 }
 
 static void net_task(void *arg)
@@ -763,6 +1343,8 @@ static void net_task(void *arg)
     for (;;) {
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
         check_reminders();
+        pool_flush_if_due();
+        ap_tick();
         bool connected;
         bool pending;
         bool retry;
@@ -773,11 +1355,14 @@ static void net_task(void *arg)
         xSemaphoreTake(mu, portMAX_DELAY);
         connected = g_connected;
         pending = g_fetch_pending;
-        quote = g_quote_pending;
+        quote = g_refill_pending;
         memcpy(key, g_key, sizeof(key));
         memcpy(ssid, g_ssid, sizeof(ssid));
         int64_t now = esp_timer_get_time();
-        retry = !connected && !g_scan_in_progress && ssid[0] && g_retry_at_us && now >= g_retry_at_us;
+        // While the setup hotspot runs, do not keep re-scanning for the home
+        // network: every scan hops channels and drops the phone.
+        retry = !connected && !g_scan_in_progress && !g_ap_active && ssid[0] && g_retry_at_us &&
+                now >= g_retry_at_us;
         if (retry) {
             g_retry_at_us = now + 8000000;
             label("连接中");
@@ -807,7 +1392,7 @@ static void net_task(void *arg)
         if (pending)
             fetch_balance(key);
         else if (quote)
-            fetch_quote(key);
+            pool_refill(key);
         else if (weather)
             fetch_weather();
     }
@@ -925,7 +1510,7 @@ static void start_scan_wifi(void)
 
 void net_init(void)
 {
-    (void)PET_GLYPH_PAD[0];
+
     mu = xSemaphoreCreateMutex();
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -936,9 +1521,7 @@ void net_init(void)
     nvs_load("pass", g_pass, sizeof(g_pass));
     nvs_load("key", g_key, sizeof(g_key));
     nvs_load("city", g_city, sizeof(g_city));
-    nvs_load("line", g_api_line, sizeof(g_api_line));
-    if (!quote_ok(g_api_line))
-        g_api_line[0] = 0;
+    pool_load();
     g_drink_min = load_int("drink", 45, 0, 240);
     g_move_min = load_int("move", 60, 0, 240);
     g_quiet_start = load_int("q0", 23, 0, 23);
@@ -956,6 +1539,26 @@ void net_init(void)
         g_lon_e6 = atoi(lon_text);
         g_has_geo = true;
     }
+    g_geo_fixed = g_has_geo && load_int("geofix", 0, 0, 1) == 1;
+    g_mode = load_int("mode", 0, 0, 1);
+    nvs_load("bname", g_bname, sizeof(g_bname));
+    g_bmonth = load_int("bmon", 0, 0, 12);
+    g_bday = load_int("bday", 0, 0, 31);
+    if (!g_bmonth || !g_bday)
+        g_bmonth = g_bday = 0;
+    g_bauto = load_int("bauto", 1, 0, 1) == 1;
+    nvs_load("msg", g_msg, sizeof(g_msg));
+    g_rpause = load_int("rpause", 0, 0, 1) == 1;
+    {
+        char stamp[12] = {0};
+        nvs_load("llmd", stamp, sizeof(stamp));
+        if (stamp[0]) {
+            g_llm_day = atoi(stamp);
+            g_llm_count = load_int("llmn", 0, 0, 1000);
+        }
+    }
+    if (g_ssid[0])
+        g_sta_down_since_us = esp_timer_get_time();
     g_last_drink_us = esp_timer_get_time();
     g_last_move_us = g_last_drink_us;
     label(g_ssid[0] ? "连接中" : "未设置");
@@ -964,6 +1567,7 @@ void net_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, 0));
@@ -984,11 +1588,19 @@ void net_init(void)
     int8_t tx_power = 0;
     ESP_ERROR_CHECK(esp_wifi_get_max_tx_power(&tx_power));
     ESP_LOGI(TAG, "Wi-Fi max TX power: %d quarter-dBm", tx_power);
+    if (mdns_init() == ESP_OK) {
+        mdns_hostname_set("pet");
+        mdns_instance_name_set("desk pet");
+        mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+        ESP_LOGI(TAG, "mDNS http://pet.local/");
+    } else {
+        ESP_LOGW(TAG, "mDNS init failed");
+    }
     portal_start();
     xTaskCreate(net_task, "net", 20480, 0, 5, &net_task_handle);
-    printf("PET READY v0.4\n");
-    printf("Open http://<device-ip>/ from the same home network; USB serial settings also work.\n");
-    printf("SSID PASS KEY CITY DRINK MOVE QUIET TZ FETCH STATUS SCAN FORGET\n");
+    printf("PET READY v0.5\n");
+    printf("Settings: http://pet.local/ or http://<device-ip>/ on the home network; USB serial also works.\n");
+    printf("SSID PASS KEY CITY LOC DRINK MOVE QUIET TZ MODE BNAME BDAY BAUTO MSG PAUSE SWEEP SONAR PET POOL BDAYDEMO AP FETCH STATUS SCAN FORGET WEBTEST\n");
     fflush(stdout);
 }
 
@@ -999,29 +1611,144 @@ void net_request_fetch(void)
     xSemaphoreGive(mu);
 }
 
+// Days from today to the next birthday (0 = today). -1 when unset or no time.
+static int days_to_birthday_locked(const struct tm *today)
+{
+    if (!g_bmonth || !g_bday)
+        return -1;
+    struct tm a = *today;
+    a.tm_hour = 12;
+    a.tm_min = a.tm_sec = 0;
+    a.tm_isdst = 0;
+    time_t now = mktime(&a);
+    for (int add = 0; add < 2; ++add) {
+        struct tm b = a;
+        b.tm_year = today->tm_year + add;
+        b.tm_mon = g_bmonth - 1;
+        b.tm_mday = g_bday;
+        time_t then = mktime(&b);
+        if (then >= now)
+            return (int)((then - now + 43200) / 86400);
+    }
+    return -1;
+}
+
+// One of the 10 birthday wishes, {n} -> configured name, no repeat until all
+// have been shown (and never the same one twice in a row).
+static void birthday_wish_locked(void)
+{
+    const uint16_t all = (uint16_t)((1u << BIRTHDAY_WISH_COUNT) - 1);
+    if ((g_wish_used & all) == all)
+        g_wish_used = 0;
+    int pick = -1, seen = 0;
+    for (int i = 0; i < BIRTHDAY_WISH_COUNT; ++i) {
+        if ((g_wish_used & (1u << i)) || (i == g_wish_last && BIRTHDAY_WISH_COUNT > 1))
+            continue;
+        if (esp_random() % (uint32_t)++seen == 0)
+            pick = i;
+    }
+    if (pick < 0)
+        pick = (g_wish_last + 1) % BIRTHDAY_WISH_COUNT;
+    g_wish_used |= (uint16_t)(1u << pick);
+    g_wish_last = pick;
+    const char *name = g_bname[0] ? g_bname : "你";
+    char line[sizeof(g_phrase)];
+    int used = 0;
+    for (const char *p = BIRTHDAY_WISHES[pick]; *p && used < (int)sizeof(line) - 1;) {
+        if (p[0] == '{' && p[1] == 'n' && p[2] == '}') {
+            used += snprintf(line + used, sizeof(line) - used, "%s", name);
+            if (used >= (int)sizeof(line))
+                used = sizeof(line) - 1;
+            p += 3;
+        } else {
+            line[used++] = *p++;
+        }
+    }
+    line[used] = 0;
+    // A long custom name may not fit two lines: fall back to the short form.
+    if (!display_bubble_fits(line))
+        snprintf(line, sizeof(line), "%s\n生日快乐\xf0\x9f\x8e\x82", name);
+    if (!display_bubble_fits(line))
+        snprintf(line, sizeof(line), "生日快乐\xf0\x9f\x8e\x82");
+    snprintf(g_phrase, sizeof(g_phrase), "%s", line);
+    printf("WISH #%d %s\n", pick, g_phrase);
+}
+
+static bool birthday_now_locked(bool have_time, const struct tm *local)
+{
+    if (g_mode == 1 || (g_demo_until_us && esp_timer_get_time() < g_demo_until_us))
+        return true;
+    if (!g_bauto || !have_time || !g_bmonth)
+        return false;
+    return local->tm_mon + 1 == g_bmonth && local->tm_mday == g_bday;
+}
+
+#define DOUBLE_MIN_US (1000 * 1000LL)
+#define DOUBLE_MAX_US (10 * 1000 * 1000LL)
+static int64_t g_last_sweep_us;
+
 void net_on_sweep(void)
 {
     int64_t now = esp_timer_get_time();
+    bool have_time = time_ready();
+    struct tm local = {0};
+    if (have_time) {
+        time_t wall = time(NULL);
+        localtime_r(&wall, &local);
+    }
     xSemaphoreTake(mu, portMAX_DELAY);
-    if (g_arm_double && now - g_arm_us < 2500000) {
+    // A detection less than 1 s after the last accepted sweep is the same
+    // wave (or echo jitter), not a new sweep: ignore it completely.
+    if (g_last_sweep_us && now - g_last_sweep_us < DOUBLE_MIN_US) {
+        printf("SWEEP ignored: %lld ms after previous (<1000 ms)\n", (long long)((now - g_last_sweep_us) / 1000));
+        xSemaphoreGive(mu);
+        return;
+    }
+    g_last_sweep_us = now;
+    ++g_anim_seq;
+    if (birthday_now_locked(have_time, &local)) {
+        printf("SWEEP single (birthday): blow candles, fireworks, wish\n");
+        // Birthday screen: blow out the candles, then fireworks and a wish.
+        // No API calls.
+        ++g_blow_seq;
+        g_candles_out_until_us = now + 60 * 1000000LL;
+        g_last_fx_us = now;
+        birthday_wish_locked();
+        g_phrase_until_us = now + 9 * 1000000LL;
         g_arm_double = false;
-        g_phrase[0] = 0;
-        if (queue_fetch(15 * 1000000LL))
-            detail("查询中");
-        else
-            detail("稍后再试");
+        xSemaphoreGive(mu);
+        return;
+    }
+    int64_t since_first = now - g_arm_us;
+    if (g_arm_double && since_first >= DOUBLE_MIN_US && since_first <= DOUBLE_MAX_US) {
+        // Second sweep 1-10 s after the first: show the balance in the bubble.
+        g_arm_double = false;
+        printf("SWEEP double: %lld ms after first -> balance\n", (long long)(since_first / 1000));
+        if (!g_key[0]) {
+            snprintf(g_phrase, sizeof(g_phrase), "密钥未设置");
+        } else if (!g_connected) {
+            snprintf(g_phrase, sizeof(g_phrase), "还没联网");
+        } else if (queue_fetch(15 * 1000000LL)) {
+            g_balance_bubble = true;
+            snprintf(g_phrase, sizeof(g_phrase), "查余额中");
+        } else if (g_total[0]) {
+            snprintf(g_phrase, sizeof(g_phrase), "余额\n%s%s", g_total, strcmp(g_currency, "CNY") ? g_currency : "元");
+        } else {
+            snprintf(g_phrase, sizeof(g_phrase), "稍后再试");
+        }
+        g_phrase_until_us = now + 7 * 1000000LL;
     } else if (g_remind[0]) {
+        printf("SWEEP single: dismiss reminder (sweep again in 1-10 s for balance)\n");
         dismiss_locked();
         g_arm_double = true;
         g_arm_us = now;
     } else {
+        printf("SWEEP single: animation + quote (sweep again in 1-10 s for balance)\n");
         show_phrase_locked();
         g_arm_double = true;
         g_arm_us = now;
-        if (g_key[0] && g_available && !g_quote_pending && now >= g_next_quote_us)
-            g_quote_pending = true;
     }
-    if (g_quote_pending && net_task_handle)
+    if (g_refill_pending && net_task_handle)
         xTaskNotifyGive(net_task_handle);
     xSemaphoreGive(mu);
 }
@@ -1029,57 +1756,103 @@ void net_on_sweep(void)
 void net_compose(UiState *ui)
 {
     memset(ui, 0, sizeof(*ui));
+    bool have_time = time_ready();
+    struct tm local = {0};
+    char clock_text[8] = {0};
+    if (have_time) {
+        time_t wall = time(NULL);
+        localtime_r(&wall, &local);
+        strftime(clock_text, sizeof(clock_text), "%H:%M", &local);
+    }
     xSemaphoreTake(mu, portMAX_DELAY);
+    ui->anim_seq = g_anim_seq;
     int64_t now_us = esp_timer_get_time();
+    bool party_before = g_was_party;
+    int phase = (int)((now_us / 4000000LL) % 2);
+    (void)phase;
     if (g_phrase[0] && now_us > g_phrase_until_us)
         g_phrase[0] = 0;
-    if (!g_ssid[0]) {
-        snprintf(ui->line[0], UI_COLS, "小粤");
-        snprintf(ui->line[1], UI_COLS, "请用USB连接");
-        snprintf(ui->line[2], UI_COLS, "串口设置WiFi");
-        snprintf(ui->line[3], UI_COLS, "SSID和密码");
+    int countdown = have_time ? days_to_birthday_locked(&local) : -1;
+    if (g_ap_active) {
+        snprintf(ui->line[0], UI_COLS, "配网热点");
+        snprintf(ui->line[1], UI_COLS, "%s", g_ap_ssid);
+        snprintf(ui->line[2], UI_COLS, "密码 %s", g_ap_pass);
+        snprintf(ui->line[3], UI_COLS, "%s", g_connected && g_ip[0] ? g_ip : "192.168.4.1");
+    } else if (birthday_now_locked(have_time, &local)) {
+        // Party screen: fireworks on entering (manual, auto on the date, or
+        // BDAYDEMO) and every 4 minutes while idle; candles relight after 60 s.
+        ui->party = true;
+        if (!g_was_party || now_us - g_last_fx_us > 240 * 1000000LL) {
+            ++g_fx_seq;
+            g_last_fx_us = now_us;
+        }
+        ui->fx_seq = g_fx_seq;
+        ui->blow_seq = g_blow_seq;
+        ui->candles_out = now_us < g_candles_out_until_us;
+        if (g_phrase[0])
+            snprintf(ui->bubble, sizeof(ui->bubble), "%s", g_phrase);
+        else
+            snprintf(ui->bubble, sizeof(ui->bubble), "祝%s\n生日快乐\xf0\x9f\x8e\x82", g_bname[0] ? g_bname : "你");
+    } else if (g_phrase[0]) {
+        snprintf(ui->bubble, sizeof(ui->bubble), "%s", g_phrase);
+    } else if (!g_ssid[0]) {
+        snprintf(ui->line[0], UI_COLS, "你好呀");
+        snprintf(ui->line[1], UI_COLS, "还没设置WiFi");
+        snprintf(ui->line[2], UI_COLS, "稍后开配网热点");
+        snprintf(ui->line[3], UI_COLS, "或用USB串口");
     } else if (!g_connected) {
-        snprintf(ui->line[0], UI_COLS, "小粤");
+        if (have_time)
+            snprintf(ui->line[0], UI_COLS, "%s %s", clock_text, WEEKDAYS[local.tm_wday % 7]);
+        else
+            snprintf(ui->line[0], UI_COLS, "你好呀");
         snprintf(ui->line[1], UI_COLS, "%s", g_wifi);
         snprintf(ui->line[2], UI_COLS, "%s", g_ssid);
-        snprintf(ui->line[3], UI_COLS, "USB串口可改设置");
-    } else if (!time_ready()) {
-        snprintf(ui->line[0], UI_COLS, "小粤");
-        snprintf(ui->line[1], UI_COLS, "%s", g_ip[0] ? g_ip : "等待地址");
-        snprintf(ui->line[2], UI_COLS, "等待校时");
-        snprintf(ui->line[3], UI_COLS, "%s", g_detail[0] ? g_detail : "连扫查余额");
-    } else {
-        char clock_text[8];
-        time_t now = time(NULL);
-        struct tm local;
-        localtime_r(&now, &local);
-        strftime(clock_text, sizeof(clock_text), "%H:%M", &local);
-        snprintf(ui->line[0], UI_COLS, "小粤 %s", clock_text);
-        if (!g_city[0])
-            snprintf(ui->line[1], UI_COLS, "未设城市");
-        else if (!g_weather[0])
-            snprintf(ui->line[1], UI_COLS, "天气查询中");
-        else
-            snprintf(ui->line[1], UI_COLS, "%s", g_weather);
-        if (g_key[0])
-            snprintf(ui->line[2], UI_COLS, "余额 %s %s", g_total[0] ? g_total : "--", g_currency);
-        else
-            snprintf(ui->line[2], UI_COLS, "密钥未设置");
         if (g_remind[0])
             snprintf(ui->line[3], UI_COLS, "%s", g_remind);
-        else if (g_phrase[0])
-            snprintf(ui->line[3], UI_COLS, "%s", g_phrase);
-        else if (g_detail[0])
-            snprintf(ui->line[3], UI_COLS, "%s", g_detail);
-        else
-            snprintf(ui->line[3], UI_COLS, "%s", g_key[0] ? "连扫查余额" : "扫一下说话");
+    } else if (!have_time) {
+        snprintf(ui->line[0], UI_COLS, "你好呀");
+        snprintf(ui->line[1], UI_COLS, "%s", g_ip[0] ? g_ip : "等待地址");
+        snprintf(ui->line[2], UI_COLS, "等待校时");
+    } else {
+        // Default companion screen: clock card with date and current weather.
+        ui->home = true;
+        strftime(ui->clock, sizeof(ui->clock), "%H:%M", &local);
+        ui->colon = (local.tm_sec % 2) == 0;
+        snprintf(ui->date, sizeof(ui->date), "%d/%d %s", local.tm_mon + 1, local.tm_mday,
+                 WEEKDAYS[local.tm_wday % 7]);
+        if (!g_city[0]) {
+            snprintf(ui->cond, sizeof(ui->cond), "未设地点");
+        } else if (g_wcode < 0) {
+            snprintf(ui->cond, sizeof(ui->cond), "查询中");
+        } else {
+            snprintf(ui->temp, sizeof(ui->temp), "%d°", g_temp_c);
+            snprintf(ui->cond, sizeof(ui->cond), "%s", weather_name(g_wcode));
+            ui->icon = weather_icon(g_wcode);
+        }
+        // Optional pill: due reminder, then things the user turned on.
+        // No birthday countdown on screen (only the day itself is celebrated).
+        (void)countdown;
+        if (g_remind[0])
+            snprintf(ui->note, sizeof(ui->note), "%s", g_remind);
+        else if (g_ip[0] && now_us < g_ip_until_us)
+            snprintf(ui->note, sizeof(ui->note), "%s", g_ip);
+        else if (g_msg[0])
+            snprintf(ui->note, sizeof(ui->note), "%s", g_msg);
     }
+    g_was_party = ui->party;
+    (void)party_before;
     xSemaphoreGive(mu);
 }
 
 void net_snapshot(NetSnapshot *out)
 {
     memset(out, 0, sizeof(*out));
+    bool have_time = time_ready();
+    struct tm local = {0};
+    if (have_time) {
+        time_t now = time(NULL);
+        localtime_r(&now, &local);
+    }
     xSemaphoreTake(mu, portMAX_DELAY);
     snprintf(out->ssid, sizeof(out->ssid), "%s", g_ssid);
     snprintf(out->city, sizeof(out->city), "%s", g_city);
@@ -1097,14 +1870,141 @@ void net_snapshot(NetSnapshot *out)
     out->drinks_today = g_drinks_today;
     out->key_set = g_key[0] != 0;
     out->connected = g_connected;
-    out->time_ok = time_ready();
-    if (out->time_ok) {
-        time_t now = time(NULL);
-        struct tm local;
-        localtime_r(&now, &local);
+    out->time_ok = have_time;
+    if (have_time)
         strftime(out->clock, sizeof(out->clock), "%H:%M", &local);
+    snprintf(out->place, sizeof(out->place), "%s", g_city);
+    out->lat_e6 = g_lat_e6;
+    out->lon_e6 = g_lon_e6;
+    out->has_geo = g_has_geo;
+    out->geo_fixed = g_geo_fixed;
+    snprintf(out->wx_today, sizeof(out->wx_today), "%s", g_wx_today);
+    snprintf(out->wx_tomorrow, sizeof(out->wx_tomorrow), "%s", g_wx_tomorrow);
+    out->mode = g_mode;
+    out->birthday_now = birthday_now_locked(have_time, &local);
+    snprintf(out->bname, sizeof(out->bname), "%s", g_bname);
+    out->bmonth = g_bmonth;
+    out->bday = g_bday;
+    out->bauto = g_bauto;
+    out->days_to_birthday = have_time ? days_to_birthday_locked(&local) : -1;
+    snprintf(out->msg, sizeof(out->msg), "%s", g_msg);
+    out->rpause = g_rpause;
+    out->llm_today = (have_time && g_llm_day == llm_day_stamp()) ? g_llm_count : 0;
+    out->llm_cap = LLM_DAILY_CAP;
+    out->ap_active = g_ap_active;
+    snprintf(out->ap_ssid, sizeof(out->ap_ssid), "%s", g_ap_ssid);
+    xSemaphoreGive(mu);
+    out->heap_free = (unsigned)esp_get_free_heap_size();
+    out->heap_min = (unsigned)esp_get_minimum_free_heap_size();
+    out->uptime_s = (unsigned)(esp_timer_get_time() / 1000000LL);
+    out->sweep_cm = sonar_threshold_cm();
+}
+
+bool net_set_location(int lat_e6, int lon_e6, const char *name)
+{
+    if (lat_e6 < -90000000 || lat_e6 > 90000000 || lon_e6 < -180000000 || lon_e6 > 180000000)
+        return false;
+    if (!name || !name[0])
+        name = "定位点";
+    if (strlen(name) >= sizeof(g_city))
+        return false;
+    char lat_text[16];
+    char lon_text[16];
+    xSemaphoreTake(mu, portMAX_DELAY);
+    bool same = g_geo_fixed && g_lat_e6 == lat_e6 && g_lon_e6 == lon_e6 && !strcmp(g_city, name);
+    if (!same) {
+        copy_field(g_city, sizeof(g_city), name);
+        g_lat_e6 = lat_e6;
+        g_lon_e6 = lon_e6;
+        g_has_geo = true;
+        g_geo_fixed = true;
+        g_weather[0] = 0;
+        g_wx_today[0] = 0;
+        g_wx_tomorrow[0] = 0;
+        queue_weather();
     }
     xSemaphoreGive(mu);
+    if (same)
+        return true;
+    snprintf(lat_text, sizeof(lat_text), "%d", lat_e6);
+    snprintf(lon_text, sizeof(lon_text), "%d", lon_e6);
+    nvs_put("city", name);
+    nvs_put("lat", lat_text);
+    nvs_put("lon", lon_text);
+    save_int("geofix", 1);
+    printf("saved\n");
+    fflush(stdout);
+    return true;
+}
+
+void net_set_mode(int mode)
+{
+    mode = mode == 1 ? 1 : 0;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    bool changed = g_mode != mode;
+    g_mode = mode;
+    g_phrase[0] = 0;
+    xSemaphoreGive(mu);
+    if (changed) {
+        save_int("mode", mode);
+        printf("saved\n");
+        fflush(stdout);
+    }
+}
+
+bool net_set_birthday(const char *name, int month, int day, bool auto_switch)
+{
+    static const int days_in[] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month || day) {
+        if (month < 1 || month > 12 || day < 1 || day > days_in[month - 1])
+            return false;
+    }
+    if (name && strlen(name) >= sizeof(g_bname))
+        return false;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    if (name)
+        copy_field(g_bname, sizeof(g_bname), name);
+    g_bmonth = month;
+    g_bday = day;
+    g_bauto = auto_switch;
+    char saved_name[sizeof(g_bname)];
+    copy_field(saved_name, sizeof(saved_name), g_bname);
+    xSemaphoreGive(mu);
+    nvs_put("bname", saved_name);
+    save_int("bmon", month);
+    save_int("bday", day);
+    save_int("bauto", auto_switch ? 1 : 0);
+    printf("saved\n");
+    fflush(stdout);
+    return true;
+}
+
+void net_set_message(const char *text)
+{
+    char clean[sizeof(g_msg)];
+    snprintf(clean, sizeof(clean), "%s", text ? text : "");
+    xSemaphoreTake(mu, portMAX_DELAY);
+    bool changed = strcmp(clean, g_msg) != 0;
+    copy_field(g_msg, sizeof(g_msg), clean);
+    xSemaphoreGive(mu);
+    if (changed) {
+        nvs_put("msg", clean);
+        printf("saved\n");
+        fflush(stdout);
+    }
+}
+
+void net_set_pause(bool paused)
+{
+    xSemaphoreTake(mu, portMAX_DELAY);
+    bool changed = g_rpause != paused;
+    g_rpause = paused;
+    xSemaphoreGive(mu);
+    if (changed) {
+        save_int("rpause", paused ? 1 : 0);
+        printf("saved\n");
+        fflush(stdout);
+    }
 }
 
 void net_apply_update(const NetUpdate *in)
@@ -1148,7 +2048,7 @@ void net_apply_update(const NetUpdate *in)
     if (in->clear_key) {
         g_key[0] = 0;
         g_available = false;
-        g_quote_pending = false;
+        g_refill_pending = false;
         save_key = key_changed = true;
     } else if (in->has_key && in->key[0]) {
         if (strlen(in->key) >= sizeof(g_key)) {
@@ -1159,10 +2059,15 @@ void net_apply_update(const NetUpdate *in)
             save_key = key_changed = true;
         }
     }
-    if (in->has_city && strcmp(in->city, g_city) && strlen(in->city) < sizeof(g_city)) {
+    if (in->has_city && strlen(in->city) < sizeof(g_city) &&
+        (strcmp(in->city, g_city) || (in->geo_auto && g_geo_fixed))) {
         copy_field(g_city, sizeof(g_city), in->city);
         copy_field(city, sizeof(city), g_city);
         g_has_geo = false;
+        g_geo_fixed = false;
+        g_wcode = -1;
+        g_wx_today[0] = 0;
+        g_wx_tomorrow[0] = 0;
         g_lat_e6 = 0;
         g_lon_e6 = 0;
         g_weather[0] = 0;
@@ -1210,6 +2115,7 @@ void net_apply_update(const NetUpdate *in)
         nvs_put("city", city);
         nvs_put("lat", "");
         nvs_put("lon", "");
+        save_int("geofix", 0);
     }
     if (save_nums) {
         save_int("drink", drink);
@@ -1284,6 +2190,138 @@ void net_handle_line(char *line)
             update.has_nums = true;
             net_apply_update(&update);
         }
+    } else if (!strncmp(line, "LOC ", 4)) {
+        char *end = 0;
+        double lat = strtod(line + 4, &end);
+        char *end2 = 0;
+        double lon = end ? strtod(end, &end2) : 0;
+        if (!end || end == line + 4 || !end2 || end2 == end) {
+            printf("usage: LOC 28.6924 115.8153 新建区\n");
+        } else {
+            while (*end2 == ' ')
+                ++end2;
+            int lat_e6 = (int)(lat * 1000000.0 + (lat >= 0 ? 0.5 : -0.5));
+            int lon_e6 = (int)(lon * 1000000.0 + (lon >= 0 ? 0.5 : -0.5));
+            if (!net_set_location(lat_e6, lon_e6, end2))
+                printf("bad value\n");
+        }
+        fflush(stdout);
+    } else if (!strncmp(line, "MODE ", 5)) {
+        const char *arg = line + 5;
+        if (!strcmp(arg, "BDAY") || !strcmp(arg, "BIRTHDAY") || !strcmp(arg, "1") || !strcmp(arg, "生日"))
+            net_set_mode(1);
+        else if (!strcmp(arg, "PET") || !strcmp(arg, "COMPANION") || !strcmp(arg, "0") || !strcmp(arg, "陪伴"))
+            net_set_mode(0);
+        else
+            printf("usage: MODE PET | MODE BDAY\n");
+        fflush(stdout);
+    } else if (!strncmp(line, "BNAME", 5) && (line[5] == ' ' || !line[5])) {
+        int m, d;
+        bool a;
+        xSemaphoreTake(mu, portMAX_DELAY);
+        m = g_bmonth;
+        d = g_bday;
+        a = g_bauto;
+        xSemaphoreGive(mu);
+        if (!net_set_birthday(line[5] ? line + 6 : "", m, d, a))
+            printf("bad value\n");
+        fflush(stdout);
+    } else if (!strncmp(line, "BDAY", 4) && (line[4] == ' ' || !line[4])) {
+        int m = 0, d = 0;
+        bool a;
+        xSemaphoreTake(mu, portMAX_DELAY);
+        a = g_bauto;
+        xSemaphoreGive(mu);
+        bool off = !line[4] || !strcmp(line + 5, "OFF");
+        if (!off && sscanf(line + 5, "%d %d", &m, &d) != 2 && sscanf(line + 5, "%d-%d", &m, &d) != 2) {
+            printf("usage: BDAY 3 15 | BDAY OFF\n");
+        } else if (!net_set_birthday(0, off ? 0 : m, off ? 0 : d, a)) {
+            printf("bad value\n");
+        }
+        fflush(stdout);
+    } else if (!strncmp(line, "BAUTO ", 6)) {
+        int m, d;
+        xSemaphoreTake(mu, portMAX_DELAY);
+        m = g_bmonth;
+        d = g_bday;
+        xSemaphoreGive(mu);
+        net_set_birthday(0, m, d, atoi(line + 6) == 1);
+    } else if (!strncmp(line, "MSG", 3) && (line[3] == ' ' || !line[3])) {
+        net_set_message(line[3] ? line + 4 : "");
+        printf("%s\n", line[3] ? "message set" : "message cleared");
+        fflush(stdout);
+    } else if (!strncmp(line, "PAUSE ", 6)) {
+        net_set_pause(atoi(line + 6) == 1);
+        printf("reminders %s\n", atoi(line + 6) == 1 ? "paused" : "on");
+        fflush(stdout);
+    } else if (!strcmp(line, "AP") || !strcmp(line, "AP ON")) {
+        xSemaphoreTake(mu, portMAX_DELAY);
+        g_ap_request = true;
+        xSemaphoreGive(mu);
+        if (net_task_handle)
+            xTaskNotifyGive(net_task_handle);
+        printf("setup hotspot requested\n");
+        fflush(stdout);
+    } else if (!strcmp(line, "AP OFF")) {
+        xSemaphoreTake(mu, portMAX_DELAY);
+        g_ap_stop_request = true;
+        g_ap_next_ok_us = esp_timer_get_time() + 30LL * 60 * 1000000LL;
+        xSemaphoreGive(mu);
+        if (net_task_handle)
+            xTaskNotifyGive(net_task_handle);
+        printf("setup hotspot off for 30 min\n");
+        fflush(stdout);
+    } else if (!strcmp(line, "PET")) {
+        // Same as one hand wave (v0.1 had this command too).
+        net_on_sweep();
+        printf("pet\n");
+        fflush(stdout);
+    } else if (!strcmp(line, "BDAYDEMO") || !strcmp(line, "BDAYDEMO OFF")) {
+        xSemaphoreTake(mu, portMAX_DELAY);
+        bool on = !strcmp(line, "BDAYDEMO");
+        g_demo_until_us = on ? esp_timer_get_time() + 180 * 1000000LL : 0;
+        g_phrase[0] = 0;
+        xSemaphoreGive(mu);
+        printf(on ? "birthday demo 3 min: fireworks now, PET blows candles (date and mode unchanged)\n"
+                  : "birthday demo off\n");
+        fflush(stdout);
+    } else if (!strcmp(line, "WEBTEST")) {
+        portal_selftest();
+    } else if (!strcmp(line, "POOL") || !strcmp(line, "POOL REFILL") || !strcmp(line, "POOL LIST")) {
+        xSemaphoreTake(mu, portMAX_DELAY);
+        int pa, pu, pg;
+        pool_counts_locked(&pa, &pu, &pg);
+        printf("pool active %d unshown %d generated %d/%d refills %d\n", pa, pu, pg, POOL_GEN_MAX, g_pool_refills);
+        if (!strcmp(line, "POOL LIST"))
+            for (int id = 0; id < PET_QUOTE_COUNT + POOL_GEN_MAX; ++id)
+                if (pool_active(id))
+                    printf("  #%d tag %d shows %d %s %s\n", id, pool_tag(id),
+                           id < PET_QUOTE_COUNT ? g_pool.bshows[id] : g_pool.gen[id - PET_QUOTE_COUNT].shows,
+                           *pool_used(id) ? "used" : "new ", pool_text(id));
+        bool refill = !strcmp(line, "POOL REFILL");
+        if (refill) {
+            if (!g_key[0] || !g_available) {
+                printf("refill needs a working API key\n");
+                refill = false;
+            } else {
+                // Manual: skips the 12 h spacing, still bound by the daily cap.
+                g_refill_pending = true;
+                g_refill_force = true;
+                printf("refill queued\n");
+            }
+        }
+        xSemaphoreGive(mu);
+        if (refill && net_task_handle)
+            xTaskNotifyGive(net_task_handle);
+        fflush(stdout);
+    } else if (!strncmp(line, "SWEEP ", 6)) {
+        int cm = atoi(line + 6);
+        printf("%s\n", sonar_set_threshold_cm(cm) ? "saved" : "bad value (5-200 cm)");
+        fflush(stdout);
+    } else if (!strncmp(line, "SONAR ", 6)) {
+        sonar_set_debug(atoi(line + 6) == 1);
+        printf("sonar debug %s\n", atoi(line + 6) == 1 ? "on" : "off");
+        fflush(stdout);
     } else if (!strcmp(line, "FETCH")) {
         xSemaphoreTake(mu, portMAX_DELAY);
         bool queued = queue_fetch(3 * 1000000LL);
@@ -1302,9 +2340,47 @@ void net_handle_line(char *line)
         printf("city %s weather %s tz %d drink %d move %d quiet %d-%d drinks %d\n",
                g_city[0] ? g_city : "-", g_weather[0] ? g_weather : "-", g_tz_hours,
                g_drink_min, g_move_min, g_quiet_start, g_quiet_end, g_drinks_today);
-        printf("quote %s detail %s heap %u\n",
-               g_api_line[0] ? g_api_line : "-", g_detail, (unsigned)esp_get_free_heap_size());
-        printf("web http://%s/ (same LAN); USB serial settings enabled\n",
+        {
+            char la[16], lo[16];
+            fmt_e6(la, sizeof(la), g_lat_e6);
+            fmt_e6(lo, sizeof(lo), g_lon_e6);
+            printf("loc %s lat %s lon %s %s today %s tomorrow %s\n", g_city[0] ? g_city : "-",
+                   g_has_geo ? la : "-", g_has_geo ? lo : "-", g_geo_fixed ? "fixed" : "geocoded",
+                   g_wx_today[0] ? g_wx_today : "-", g_wx_tomorrow[0] ? g_wx_tomorrow : "-");
+        }
+        printf("mode %s bname %s bday %02d-%02d bauto %d msg %s reminders %s\n",
+               g_mode ? "birthday" : "companion", g_bname[0] ? g_bname : "-", g_bmonth, g_bday,
+               g_bauto ? 1 : 0, g_msg[0] ? g_msg : "-", g_rpause ? "paused" : "on");
+        {
+            struct tm today = {0};
+            bool have = time_ready();
+            if (have) {
+                time_t wall = time(NULL);
+                localtime_r(&wall, &today);
+            }
+            int days = have ? days_to_birthday_locked(&today) : -1;
+            printf("birthday %s, countdown %d day(s), screen %s\n", g_bmonth ? "set" : "unset", days,
+                   birthday_now_locked(have, &today) ? "party" : "companion");
+        }
+        printf("llm %s today %d/%d (batch refills only, >=12 h apart)\n", LLM_MODEL,
+               (time_ready() && g_llm_day == llm_day_stamp()) ? g_llm_count : 0, LLM_DAILY_CAP);
+        int pa, pu, pg;
+        pool_counts_locked(&pa, &pu, &pg);
+        printf("pool active %d unshown %d generated %d/%d refills %d%s\n", pa, pu, pg, POOL_GEN_MAX,
+               g_pool_refills, g_refill_pending ? " (refill queued)" : "");
+        printf("detail %s heap %u min %u uptime %lus\n", g_detail, (unsigned)esp_get_free_heap_size(),
+               (unsigned)esp_get_minimum_free_heap_size(), (unsigned long)(esp_timer_get_time() / 1000000LL));
+        if (g_ap_active)
+            printf("setup hotspot %s password %s http://192.168.4.1/ clients %d\n", g_ap_ssid, g_ap_pass,
+                   g_ap_clients);
+        else
+            printf("setup hotspot off\n");
+        {
+            char sonar[96];
+            sonar_status(sonar, sizeof(sonar));
+            printf("%s\n", sonar);
+        }
+        printf("web http://pet.local/ or http://%s/ (same LAN); USB serial settings enabled\n",
                g_ip[0] ? g_ip : "no-IP-yet");
         xSemaphoreGive(mu);
         fflush(stdout);
@@ -1328,14 +2404,14 @@ void net_handle_line(char *line)
         g_topped[0] = 0;
         g_currency[0] = 0;
         g_available = false;
-        g_quote_pending = false;
+        g_refill_pending = false;
         detail("密钥未设置");
         xSemaphoreGive(mu);
         request_reconnect();
         printf("cleared\n");
         fflush(stdout);
     } else if (line[0]) {
-        printf("commands: SSID, PASS, KEY, CITY, DRINK, MOVE, QUIET, TZ, FETCH, STATUS, SCAN, FORGET\n");
+        printf("commands: SSID, PASS, KEY, CITY, LOC, DRINK, MOVE, QUIET, TZ, MODE, BNAME, BDAY, BAUTO, MSG, PAUSE, SWEEP, SONAR, PET, POOL, BDAYDEMO, AP, FETCH, STATUS, SCAN, FORGET, WEBTEST\n");
         fflush(stdout);
     }
 }

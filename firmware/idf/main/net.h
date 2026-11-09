@@ -33,6 +33,31 @@ typedef struct {
     bool key_set;
     bool connected;
     bool time_ok;
+    // v0.5
+    char place[32];
+    int lat_e6;
+    int lon_e6;
+    bool has_geo;
+    bool geo_fixed;
+    char wx_today[24];
+    char wx_tomorrow[24];
+    int mode;            // 0 companion, 1 birthday
+    bool birthday_now;   // birthday screen is showing (mode 1 or auto on the date)
+    char bname[32];
+    int bmonth;
+    int bday;
+    bool bauto;
+    int days_to_birthday; // -1 when no birthday is set
+    char msg[40];
+    bool rpause;
+    int llm_today;
+    int llm_cap;
+    bool ap_active;
+    char ap_ssid[24];
+    unsigned heap_free;
+    unsigned heap_min;
+    unsigned uptime_s;
+    int sweep_cm;
 } NetSnapshot;
 
 typedef struct {
@@ -52,9 +77,16 @@ typedef struct {
     bool clear_key;
     bool has_city;
     bool has_nums;
+    bool geo_auto; // city given without coordinates: drop fixed coordinates and geocode
 } NetUpdate;
 
 void net_snapshot(NetSnapshot *out);
+// v0.5 settings shared by the web page and USB serial. All persist in NVS.
+bool net_set_location(int lat_e6, int lon_e6, const char *name);
+void net_set_mode(int mode);
+bool net_set_birthday(const char *name, int month, int day, bool auto_switch);
+void net_set_message(const char *text);
+void net_set_pause(bool paused);
 void net_apply_update(const NetUpdate *update);
 
 #endif

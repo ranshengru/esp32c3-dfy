@@ -407,7 +407,7 @@ void screen_test(void)
     SerialCommands serial;
     serial.length = 0;
     serial.overflow = false;
-    say(&pet.bubble, "祝小粤\n生日快乐🎂");
+    say(&pet.bubble, "祝你\n生日快乐🎂");
 
     SweepGate gate;
     gate.first = 0;
