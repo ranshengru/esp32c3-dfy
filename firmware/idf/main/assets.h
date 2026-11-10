@@ -13,6 +13,9 @@ const uint8_t *assets_frame(int expr, int frame);
 // order as the framebuffer). Uses a few KB of workspace, not a second picture.
 bool assets_blit(int expr, int frame, uint16_t *dest);
 int assets_frames(int expr);
+// How long this keyframe stays up. Unchanged stretches are not extra frames;
+// the representative pose just has a longer hold.
+int assets_hold_ms(int expr, int frame);
 bool assets_has(int expr);
 int assets_expr_count(void);
 // One line for STATUS, and the short note on the settings page.

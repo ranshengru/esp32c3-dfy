@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Pack the eight expression clips into assets.bin.
+"""Pack expression clips from the original videos.
 
-Each clip is a short MJPEG: four baseline JPEG frames of the 128x160 screen.
-The firmware plays a frame by decoding it into the framebuffer it already
-has. 困 and 打盹 are separate clips.
+Keyframes are picked from each clip, not sampled on a fixed clock. A stretch
+where the picture does not change is not stored. The first frame is the
+representative pose and stays up longer; a blink or a drifting Z is short.
 """
 
 import io
@@ -21,59 +21,21 @@ PREVIEW = ROOT / "docs" / "v1.0-expressions-preview.png"
 WIDTH, HEIGHT = 128, 160
 SHIFT = 10
 RAW = WIDTH * HEIGHT * 2
-PACK_VERSION = 20261112
-VIDEO_DIR = Path("/workspace/artifacts/imagine_videos")
-GRAB_DIR = Path("/tmp/expr-frames")
+PACK_VERSION = 20261113
+VIDEO_DIR = ROOT / "assets" / "expressions" / "videos"
 
+# (name, label, source video, [(frame_index at 8 fps, hold_ms), ...])
+# Picked by watching the original clip. A repeated blink, a return to the same
+# pose, or a whole-body wobble with the same face is not a keyframe.
 EXPRS = [
-    ("neutral", "平常", [
-        ("a623c533-d39f-4ead-bb52-7e32291103b7.mp4", 0.6),
-        ("a623c533-d39f-4ead-bb52-7e32291103b7.mp4", 2.2),
-        ("a623c533-d39f-4ead-bb52-7e32291103b7.mp4", 3.6),
-        ("a623c533-d39f-4ead-bb52-7e32291103b7.mp4", 5.0),
-    ]),
-    ("happy", "开心", [
-        ("eca01003-3346-4f02-a288-68ecd509bb7c.mp4", 0.6),
-        ("eca01003-3346-4f02-a288-68ecd509bb7c.mp4", 2.0),
-        ("eca01003-3346-4f02-a288-68ecd509bb7c.mp4", 3.6),
-        ("eca01003-3346-4f02-a288-68ecd509bb7c.mp4", 5.0),
-    ]),
-    ("sleepy", "困", [
-        ("6d54b0f9-2302-47d8-a3fa-371fd43090c3.mp4", 0.6),
-        ("6d54b0f9-2302-47d8-a3fa-371fd43090c3.mp4", 2.2),
-        ("6d54b0f9-2302-47d8-a3fa-371fd43090c3.mp4", 3.8),
-        ("6d54b0f9-2302-47d8-a3fa-371fd43090c3.mp4", 5.0),
-    ]),
-    ("sleeping", "打盹", [
-        ("14b06b9c-750d-459e-8630-d090d3729719.mp4", 0.6),
-        ("14b06b9c-750d-459e-8630-d090d3729719.mp4", 2.2),
-        ("14b06b9c-750d-459e-8630-d090d3729719.mp4", 3.8),
-        ("14b06b9c-750d-459e-8630-d090d3729719.mp4", 5.0),
-    ]),
-    ("tsundere", "傲娇", [
-        ("76fa2233-ec2b-4b7e-bc16-1199af568045.mp4", 0.6),
-        ("76fa2233-ec2b-4b7e-bc16-1199af568045.mp4", 2.2),
-        ("76fa2233-ec2b-4b7e-bc16-1199af568045.mp4", 3.8),
-        ("76fa2233-ec2b-4b7e-bc16-1199af568045.mp4", 5.0),
-    ]),
-    ("surprised", "惊讶", [
-        ("cd7809e1-5258-4d32-bd60-a710be44bf47.mp4", 0.5),
-        ("cd7809e1-5258-4d32-bd60-a710be44bf47.mp4", 1.8),
-        ("cd7809e1-5258-4d32-bd60-a710be44bf47.mp4", 3.4),
-        ("cd7809e1-5258-4d32-bd60-a710be44bf47.mp4", 5.0),
-    ]),
-    ("worried", "担心", [
-        ("dda351ae-9988-417d-9f91-7e155403473f.mp4", 0.6),
-        ("dda351ae-9988-417d-9f91-7e155403473f.mp4", 2.2),
-        ("dda351ae-9988-417d-9f91-7e155403473f.mp4", 3.8),
-        ("dda351ae-9988-417d-9f91-7e155403473f.mp4", 5.0),
-    ]),
-    ("excited", "兴奋", [
-        ("b71c0e08-ed87-4bbe-830c-b5451847074a.mp4", 0.6),
-        ("b71c0e08-ed87-4bbe-830c-b5451847074a.mp4", 2.0),
-        ("b71c0e08-ed87-4bbe-830c-b5451847074a.mp4", 3.6),
-        ("b71c0e08-ed87-4bbe-830c-b5451847074a.mp4", 5.0),
-    ]),
+    ("neutral", "平常", "neutral.mp4", [(4, 2200), (28, 160)]),
+    ("happy", "开心", "happy.mp4", [(1, 1800), (7, 180)]),
+    ("sleepy", "困", "sleepy.mp4", [(1, 1200), (8, 250), (16, 1400)]),
+    ("sleeping", "打盹", "sleeping.mp4", [(0, 800), (2, 400), (10, 500)]),
+    ("tsundere", "傲娇", "tsundere.mp4", [(4, 2000), (34, 220)]),
+    ("surprised", "惊讶", "surprised.mp4", [(4, 2000), (28, 180)]),
+    ("worried", "担心", "worried.mp4", [(0, 1800), (6, 200)]),
+    ("excited", "兴奋", "excited.mp4", [(12, 1600), (6, 320)]),
 ]
 
 
@@ -89,12 +51,15 @@ def screen_canvas(im):
     return canvas
 
 
-def grab(video, second, dest):
-    if dest.exists():
-        return
+def grab(video, index, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # 0-based index into an 8 fps sampling of the original clip.
     subprocess.check_call(
-        ["ffmpeg", "-y", "-ss", str(second), "-i", str(video), "-frames:v", "1", str(dest)],
+        [
+            "ffmpeg", "-y", "-i", str(video),
+            "-vf", f"fps=8,select=eq(n\\,{index})",
+            "-vsync", "vfr", "-frames:v", "1", str(dest),
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -119,30 +84,34 @@ def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     entries = []
     previews = []
-    for expr_id, (key, label, frames) in enumerate(EXPRS):
-        for frame_i, (video_name, second) in enumerate(frames):
-            png = OUT_DIR / f"{key}_{frame_i}.png"
-            if png.exists():
-                canvas = Image.open(png).convert("RGB")
-                if canvas.size != (WIDTH, HEIGHT):
-                    canvas = screen_canvas(canvas)
-            else:
-                full = GRAB_DIR / f"{key}_{frame_i}.png"
-                grab(VIDEO_DIR / video_name, second, full)
-                canvas = screen_canvas(Image.open(full))
-                canvas.save(png)
-            raw = frame_bytes(canvas)
-            entries.append((expr_id, frame_i, raw))
+    for expr_id, (key, label, video_name, keys) in enumerate(EXPRS):
+        kept = []
+        for frame_i, (index, hold_ms) in enumerate(keys):
+            full = OUT_DIR / f".grab_{key}_{frame_i}.png"
+            grab(VIDEO_DIR / video_name, index, full)
+            canvas = screen_canvas(Image.open(full))
+            full.unlink()
+            canvas.save(OUT_DIR / f"{key}_{frame_i}.png")
+            jpeg = frame_bytes(canvas)
+            kept.append((expr_id, frame_i, hold_ms, jpeg))
             if frame_i == 0:
                 previews.append((label, canvas))
-            print(f"{key} frame {frame_i}: jpeg {len(raw)} bytes")
+            print(f"{key} frame@{index} hold {hold_ms}ms: jpeg {len(jpeg)}")
+        stale = frame_i
+        while True:
+            stale += 1
+            old = OUT_DIR / f"{key}_{stale}.png"
+            if not old.exists():
+                break
+            old.unlink()
+        entries.extend(kept)
 
     directory = bytearray()
     payload = bytearray()
     header_size = 32
     cursor = header_size + len(entries) * 16
-    for expr_id, frame_i, comp in entries:
-        directory += struct.pack("<BBHIII", expr_id, frame_i, 0, cursor, len(comp), crc32(comp))
+    for expr_id, frame_i, hold_ms, comp in entries:
+        directory += struct.pack("<BBHIII", expr_id, frame_i, hold_ms, cursor, len(comp), crc32(comp))
         payload += comp
         cursor += len(comp)
     data = bytes(directory) + bytes(payload)

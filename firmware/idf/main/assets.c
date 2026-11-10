@@ -28,7 +28,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t expr;
     uint8_t frame;
-    uint16_t reserved;
+    uint16_t hold_ms;
     uint32_t offset;
     uint32_t size;
     uint32_t crc;
@@ -140,6 +140,14 @@ int assets_frames(int expr)
         if (g_entries[i].expr == expr)
             ++n;
     return n;
+}
+
+int assets_hold_ms(int expr, int frame)
+{
+    for (int i = 0; i < g_count; ++i)
+        if (g_entries[i].expr == expr && g_entries[i].frame == frame)
+            return g_entries[i].hold_ms ? g_entries[i].hold_ms : 450;
+    return 450;
 }
 
 bool assets_has(int expr)

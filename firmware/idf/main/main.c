@@ -57,7 +57,7 @@ static bool apply_face(const UiState *ui)
         g_face_expr = ui->expr;
         g_face_frame = 0;
         g_face_us = now;
-    } else if (frames > 1 && now - g_face_us >= 450000) {
+    } else if (frames > 1 && now - g_face_us >= (int64_t)assets_hold_ms(ui->expr, g_face_frame) * 1000) {
         g_face_frame = (g_face_frame + 1) % frames;
         g_face_us = now;
     }
