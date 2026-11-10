@@ -1,6 +1,8 @@
 // Screen lines are truncated on purpose; the panel only fits about 7 hanzi.
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 #include "net.h"
+#include "assets.h"
+#include "mood.h"
 #include "portal.h"
 #include "prompts.h"
 #include "quotes.h"
@@ -96,6 +98,15 @@ static wifi_ap_record_t g_scan_records[24];
 // v0.5 state
 static bool g_geo_fixed;          // coordinates typed by the user, skip geocoding
 static int g_mode;                // 0 companion, 1 birthday
+static int g_expr;                // 0 classic portrait, 1 expression pack
+static int g_phrase_mood;
+static int g_idle_expr = EXPR_NEUTRAL;
+static int64_t g_idle_until_us;
+static int g_force_expr = -1;
+static int64_t g_force_until_us;
+static bool g_cycle;
+static int g_face = EXPR_NEUTRAL;
+static char g_face_reason[24] = "idle";
 static char g_bname[32];
 static int g_bmonth;
 static int g_bday;
@@ -453,7 +464,7 @@ enum {
     POOL_LOW_PCT = 20,
     POOL_BATCH = 20,
     POOL_RETIRED = 255,
-    POOL_VERSION = 2,
+    POOL_VERSION = 3,
 };
 
 #define FILL_TEMP_WORST "-10°C"
@@ -591,6 +602,8 @@ static int pool_validate(PoolStore *p)
         }
         bool ok = memchr(g->text, 0, POOL_TEXT) != 0 && (g->tag >> 4) < T_COUNT && (g->tag & 15) < C_COUNT &&
                   g->shows < POOL_RETIRE && g->used <= 1;
+        if (ok && g->pad >= EXPR_COUNT)
+            g->pad = (uint8_t)mood_from_text(g->text);
         if (ok) {
             char copy[POOL_TEXT];
             strcpy(copy, g->text);
@@ -620,6 +633,18 @@ static void pool_decode(const void *blob, size_t length, PoolStore *out, char *s
         } else {
             dropped = pool_validate(out);
             snprintf(status, status_len, "ok");
+        }
+    } else if (length == sizeof(PoolStore) && ((const PoolStore *)blob)->version == 2) {
+        memcpy(out, blob, sizeof(*out));
+        if (pool_crc(out) != out->crc) {
+            memset(out, 0, sizeof(*out));
+            snprintf(status, status_len, "corrupt crc, seeds only");
+        } else {
+            for (int i = 0; i < POOL_GEN_MAX; ++i)
+                if (out->gen[i].text[0])
+                    out->gen[i].pad = (uint8_t)mood_from_text(out->gen[i].text);
+            dropped = pool_validate(out);
+            snprintf(status, status_len, "migrated v2");
         }
     } else if (length == sizeof(PoolStoreV1) && ((const PoolStoreV1 *)blob)->version == 1) {
         static const uint8_t map[8] = {T_ANY << 4 | C_GENERAL,     T_MORNING << 4 | C_GENERAL,
@@ -993,6 +1018,14 @@ static void show_phrase_locked(void)
         snprintf(filled, sizeof(filled), "%s", PET_QUOTES[id].text);
     }
     snprintf(g_phrase, sizeof(g_phrase), "%s", filled);
+    if (id < PET_QUOTE_COUNT)
+        g_phrase_mood = PET_QUOTES[id].mood;
+    else if (id >= 0)
+        g_phrase_mood = g_pool.gen[id - PET_QUOTE_COUNT].pad;
+    else
+        g_phrase_mood = mood_from_text(filled);
+    if (g_phrase_mood >= EXPR_COUNT)
+        g_phrase_mood = EXPR_NEUTRAL;
     g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
     *pool_used(id) = 1;
     g_recent[g_recent_pos] = id;
@@ -1041,6 +1074,7 @@ static void dismiss_locked(void)
     }
     g_remind[0] = 0;
     g_remind_kind = 0;
+    g_phrase_mood = EXPR_HAPPY;
     g_phrase_until_us = now + 6 * 1000000LL;
 }
 
@@ -1174,6 +1208,7 @@ static void fetch_balance(const char *key)
     if (g_balance_bubble && !strcmp(g_phrase, PHRASE_BALANCE_WAIT)) {
         // Failed: show why instead of a stale "querying".
         snprintf(g_phrase, sizeof(g_phrase), "%s", g_detail[0] ? g_detail : "查询失败");
+        g_phrase_mood = EXPR_TSUNDERE;
         g_phrase_until_us = esp_timer_get_time() + 6 * 1000000LL;
     }
     g_balance_bubble = false;
@@ -1695,13 +1730,19 @@ static void pool_refill(const char *key)
         cJSON *item;
         cJSON_ArrayForEach(item, list)
         {
-            const char *ttext = 0, *ctext = 0, *text = 0;
+            const char *ttext = 0, *ctext = 0, *mtext = 0, *text = 0;
             if (cJSON_IsArray(item) && cJSON_GetArraySize(item) >= 3) {
+                int n = cJSON_GetArraySize(item);
                 cJSON *t = cJSON_GetArrayItem(item, 0), *w = cJSON_GetArrayItem(item, 1),
-                      *s = cJSON_GetArrayItem(item, 2);
+                      *third = cJSON_GetArrayItem(item, 2), *fourth = n >= 4 ? cJSON_GetArrayItem(item, 3) : 0;
                 ttext = cJSON_IsString(t) ? t->valuestring : 0;
                 ctext = cJSON_IsString(w) ? w->valuestring : 0;
-                text = cJSON_IsString(s) ? s->valuestring : 0;
+                if (fourth && cJSON_IsString(fourth)) {
+                    mtext = cJSON_IsString(third) ? third->valuestring : 0;
+                    text = fourth->valuestring;
+                } else {
+                    text = cJSON_IsString(third) ? third->valuestring : 0;
+                }
             } else if (cJSON_IsObject(item)) {
                 cJSON *t = cJSON_GetObjectItem(item, "t"), *w = cJSON_GetObjectItem(item, "w"),
                       *s = cJSON_GetObjectItem(item, "s");
@@ -1725,10 +1766,14 @@ static void pool_refill(const char *key)
             }
             xSemaphoreTake(mu, portMAX_DELAY);
             int slot = pool_has_locked(line) ? -2 : pool_free_slot_locked();
+            int stored_mood = EXPR_NEUTRAL;
             if (slot >= 0) {
                 GenLine *g = &g_pool.gen[slot];
                 memset(g, 0, sizeof(*g));
                 g->tag = (uint8_t)(ttag << 4 | ctag);
+                int mood = mood_parse(mtext);
+                g->pad = (uint8_t)(mood >= 0 ? mood : mood_from_text(line));
+                stored_mood = g->pad;
                 snprintf(g->text, sizeof(g->text), "%s", line);
                 ++added;
             }
@@ -1736,7 +1781,7 @@ static void pool_refill(const char *key)
             if (slot == -2)
                 ++rejected;
             if (slot >= 0)
-                printf("POOL add [%s/%s] %s\n", T_NAMES[ttag], C_NAMES[ctag], line);
+                printf("POOL add [%s/%s/%s] %s\n", T_NAMES[ttag], C_NAMES[ctag], mood_name(stored_mood), line);
         }
         cJSON_Delete(batch);
     } else if (status == 401 || status == 402) {
@@ -2066,6 +2111,7 @@ void net_init(void)
     }
     g_geo_fixed = g_has_geo && load_int("geofix", 0, 0, 1) == 1;
     g_mode = load_int("mode", 0, 0, 1);
+    g_expr = load_int("expr", 0, 0, 1);
     nvs_load("bname", g_bname, sizeof(g_bname));
     g_bmonth = load_int("bmon", 0, 0, 12);
     g_bday = load_int("bday", 0, 0, 31);
@@ -2126,10 +2172,10 @@ void net_init(void)
     }
     portal_start();
     xTaskCreate(net_task, "net", 20480, 0, 5, &net_task_handle);
-    printf("PET READY v0.5\n");
+    printf("PET READY v1.0\n");
     printf("boot #%d reset %s; pool %s\n", g_boots, g_reset_name, g_pool_boot);
     printf("Settings: http://pet.local/ or http://<device-ip>/ on the home network; USB serial also works.\n");
-    printf("SSID PASS KEY CITY LOC DRINK MOVE QUIET TZ MODE BNAME BDAY BAUTO MSG PAUSE SWEEP SONAR PET POOL BDAYDEMO AP FETCH STATUS SCAN FORGET WEBTEST\n");
+    printf("SSID PASS KEY CITY LOC DRINK MOVE QUIET TZ MODE EXPR BNAME BDAY BAUTO MSG PAUSE SWEEP SONAR PET POOL BDAYDEMO AP FETCH STATUS SCAN FORGET WEBTEST\n");
     fflush(stdout);
 }
 
@@ -2200,6 +2246,7 @@ static void birthday_wish_locked(void)
     if (!display_bubble_fits(line))
         snprintf(line, sizeof(line), "生日快乐\xf0\x9f\x8e\x82");
     snprintf(g_phrase, sizeof(g_phrase), "%s", line);
+    g_phrase_mood = EXPR_HAPPY;
     printf("WISH #%d %s\n", pick, g_phrase);
 }
 
@@ -2255,8 +2302,10 @@ void net_on_sweep(void)
         printf("SWEEP double: %lld ms after first -> balance\n", (long long)(since_first / 1000));
         if (!g_key[0]) {
             snprintf(g_phrase, sizeof(g_phrase), "密钥未设置");
+            g_phrase_mood = EXPR_TSUNDERE;
         } else if (!g_connected) {
             snprintf(g_phrase, sizeof(g_phrase), "还没联网");
+            g_phrase_mood = EXPR_TSUNDERE;
         } else if (queue_fetch(15 * 1000000LL)) {
             g_balance_bubble = true;
             snprintf(g_phrase, sizeof(g_phrase), "%s", PHRASE_BALANCE_WAIT);
@@ -2264,6 +2313,7 @@ void net_on_sweep(void)
             snprintf(g_phrase, sizeof(g_phrase), "%s", PHRASE_BALANCE);
         } else {
             snprintf(g_phrase, sizeof(g_phrase), "稍后再试");
+            g_phrase_mood = EXPR_TSUNDERE;
         }
         g_phrase_until_us = now + 7 * 1000000LL;
     } else if (g_remind[0]) {
@@ -2388,6 +2438,133 @@ void net_compose(UiState *ui)
     }
     g_was_party = ui->party;
     (void)party_before;
+    {
+        int face = EXPR_NEUTRAL;
+        const char *reason = "idle";
+        if (g_force_expr >= 0 && g_force_expr < EXPR_COUNT && now_us < g_force_until_us) {
+            face = g_force_expr;
+            reason = "show";
+        } else if (g_cycle && assets_expr_count() > 0) {
+            int ids[EXPR_COUNT], n = 0;
+            for (int i = 0; i < EXPR_COUNT; ++i)
+                if (assets_has(i))
+                    ids[n++] = i;
+            face = ids[(int)((now_us / 2000000LL) % n)];
+            reason = "cycle";
+        } else if (ui->party && ui->candles_out) {
+            face = EXPR_EXCITED;
+            reason = "birthday";
+        } else if (ui->party) {
+            face = ((now_us / 2000000LL) & 1) ? EXPR_EXCITED : EXPR_HAPPY;
+            reason = "birthday";
+        } else if (!strcmp(g_phrase, PHRASE_BALANCE_WAIT)) {
+            face = EXPR_NEUTRAL;
+            reason = "balance";
+        } else if (!strcmp(g_phrase, PHRASE_BALANCE)) {
+            int sign = 1;
+            const char *p = g_total;
+            if (*p == '-') {
+                sign = -1;
+                ++p;
+            }
+            int whole = 0, frac = 0, places = 0;
+            while (*p >= '0' && *p <= '9')
+                whole = whole * 10 + (*p++ - '0');
+            if (*p == '.') {
+                ++p;
+                while (*p >= '0' && *p <= '9' && places < 2) {
+                    frac = frac * 10 + (*p++ - '0');
+                    ++places;
+                }
+                if (places == 1)
+                    frac *= 10;
+            }
+            int cents = sign * (whole * 100 + frac);
+            if (!g_available) {
+                face = EXPR_TSUNDERE;
+            } else if (cents >= 2000) {
+                face = EXPR_HAPPY;
+            } else if (cents >= 500) {
+                face = EXPR_NEUTRAL;
+            } else {
+                face = EXPR_WORRIED;
+            }
+            reason = "balance";
+        } else if (g_phrase[0]) {
+            face = g_phrase_mood;
+            reason = "line";
+        } else if (g_remind[0]) {
+            face = EXPR_WORRIED;
+            reason = "remind";
+        } else if (now_us < g_idle_until_us) {
+            face = g_idle_expr;
+            reason = g_face_reason[0] ? g_face_reason : "idle";
+        } else {
+            int cand[8], n = 0;
+            int hour = have_time ? local.tm_hour : -1;
+            int minute = have_time ? local.tm_min : 0;
+            bool late = hour >= 23 || (hour >= 0 && hour < 4);
+            bool afternoon = hour >= 14 && hour <= 16;
+            bool quiet = !g_last_sweep_us || now_us - g_last_sweep_us > 10 * 60 * 1000000LL;
+            bool snow = (g_wcode >= 71 && g_wcode <= 77) || g_wcode == 85 || g_wcode == 86;
+            bool rain = g_wcode >= 51 && !snow;
+            bool hot = g_wcode >= 0 && g_temp_c >= 30;
+            bool cold = g_wcode >= 0 && g_temp_c <= 10;
+            bool meal = have_time && ((hour == 11 && minute >= 30) || (hour == 12 && minute <= 30) ||
+                                      (hour == 17 && minute >= 30) || (hour == 18 && minute <= 30));
+            if (late && quiet) {
+                cand[n++] = EXPR_SLEEPING;
+                reason = "late-night-idle";
+            } else if (late || afternoon) {
+                cand[n++] = EXPR_SLEEPY;
+                cand[n++] = EXPR_NEUTRAL;
+                reason = "drowsy";
+            }
+            if (rain) {
+                cand[n++] = EXPR_WORRIED;
+                cand[n++] = EXPR_NEUTRAL;
+                reason = "rain";
+            }
+            if (hot) {
+                cand[n++] = EXPR_SLEEPY;
+                cand[n++] = EXPR_NEUTRAL;
+                reason = "hot";
+            }
+            if (cold) {
+                cand[n++] = EXPR_WORRIED;
+                cand[n++] = EXPR_NEUTRAL;
+                reason = "cold";
+            }
+            if (meal) {
+                cand[n++] = EXPR_HAPPY;
+                cand[n++] = EXPR_NEUTRAL;
+                reason = "meal";
+            }
+            if (!n) {
+                cand[n++] = EXPR_NEUTRAL;
+                cand[n++] = EXPR_HAPPY;
+                cand[n++] = EXPR_NEUTRAL;
+                reason = "idle";
+            }
+            int usable = 0;
+            for (int i = 0; i < n; ++i)
+                if (assets_has(cand[i]) || !assets_expr_count())
+                    cand[usable++] = cand[i];
+            face = usable ? cand[esp_random() % usable] : EXPR_NEUTRAL;
+            g_idle_expr = face;
+            g_idle_until_us = now_us + 60 * 1000000LL;
+        }
+        if (face < 0 || face >= EXPR_COUNT)
+            face = EXPR_NEUTRAL;
+        ui->expr_on = g_expr == 1;
+        ui->expr = (uint8_t)face;
+        g_face = face;
+        if (reason != g_face_reason) {
+            char why[24];
+            snprintf(why, sizeof(why), "%s", reason);
+            snprintf(g_face_reason, sizeof(g_face_reason), "%s", why);
+        }
+    }
     xSemaphoreGive(mu);
 }
 
@@ -2440,6 +2617,8 @@ void net_snapshot(NetSnapshot *out)
     out->llm_cap = LLM_DAILY_CAP;
     out->ap_active = g_ap_active;
     snprintf(out->ap_ssid, sizeof(out->ap_ssid), "%s", g_ap_ssid);
+    out->expr_on = g_expr;
+    snprintf(out->assets, sizeof(out->assets), "%s", assets_status_line());
     xSemaphoreGive(mu);
     out->heap_free = (unsigned)esp_get_free_heap_size();
     out->heap_min = (unsigned)esp_get_minimum_free_heap_size();
@@ -2495,6 +2674,21 @@ void net_set_mode(int mode)
     if (changed) {
         save_int("mode", mode);
         printf("saved\n");
+        fflush(stdout);
+    }
+}
+
+void net_set_expr(int on)
+{
+    on = on == 1 ? 1 : 0;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    bool changed = g_expr != on;
+    g_expr = on;
+    g_idle_until_us = 0;
+    xSemaphoreGive(mu);
+    if (changed) {
+        save_int("expr", on);
+        printf("expr %s\n", on ? "mood" : "classic");
         fflush(stdout);
     }
 }
@@ -2762,6 +2956,38 @@ void net_handle_line(char *line)
         else
             printf("usage: MODE PET | MODE BDAY\n");
         fflush(stdout);
+    } else if (!strcmp(line, "EXPR 0")) {
+        g_cycle = false;
+        g_force_expr = -1;
+        net_set_expr(0);
+    } else if (!strcmp(line, "EXPR 1")) {
+        g_cycle = false;
+        g_force_expr = -1;
+        net_set_expr(1);
+    } else if (!strcmp(line, "EXPR SHOW OFF")) {
+        g_force_expr = -1;
+        printf("expr show off\n");
+        fflush(stdout);
+    } else if (!strncmp(line, "EXPR SHOW ", 10)) {
+        int id = mood_parse(line + 10);
+        if (id < 0) {
+            printf("usage: EXPR SHOW neutral|happy|sleepy|sleeping|tsundere|surprised|worried|excited\n");
+        } else {
+            g_cycle = false;
+            g_force_expr = id;
+            g_force_until_us = esp_timer_get_time() + 30 * 1000000LL;
+            printf("expr show %s 30s\n", mood_name(id));
+        }
+        fflush(stdout);
+    } else if (!strcmp(line, "EXPR CYCLE")) {
+        g_force_expr = -1;
+        g_cycle = !g_cycle;
+        printf("expr cycle %s\n", g_cycle ? "on" : "off");
+        fflush(stdout);
+    } else if (!strcmp(line, "ASSETS")) {
+        assets_print();
+    } else if (!strcmp(line, "ASSETS SELFTEST")) {
+        assets_selftest();
     } else if (!strncmp(line, "BNAME", 5) && (line[5] == ' ' || !line[5])) {
         int m, d;
         bool a;
@@ -2908,9 +3134,10 @@ void net_handle_line(char *line)
                    g_has_geo ? la : "-", g_has_geo ? lo : "-", g_geo_fixed ? "fixed" : "geocoded",
                    g_wx_today[0] ? g_wx_today : "-", g_wx_tomorrow[0] ? g_wx_tomorrow : "-");
         }
-        printf("mode %s bname %s bday %02d-%02d bauto %d msg %s reminders %s\n",
-               g_mode ? "birthday" : "companion", g_bname[0] ? g_bname : "-", g_bmonth, g_bday,
+        printf("mode %s expr %s bname %s bday %02d-%02d bauto %d msg %s reminders %s\n",
+               g_mode ? "birthday" : "companion", g_expr ? "mood" : "classic", g_bname[0] ? g_bname : "-", g_bmonth, g_bday,
                g_bauto ? 1 : 0, g_msg[0] ? g_msg : "-", g_rpause ? "paused" : "on");
+        printf("expr mode=%d now=%s reason=%s %s\n", g_expr, mood_name(g_face), g_face_reason, assets_status_line());
         {
             struct tm today = {0};
             bool have = time_ready();
@@ -2988,7 +3215,7 @@ void net_handle_line(char *line)
         printf("cleared\n");
         fflush(stdout);
     } else if (line[0]) {
-        printf("commands: SSID, PASS, KEY, CITY, LOC, DRINK, MOVE, QUIET, TZ, MODE, BNAME, BDAY, BAUTO, MSG, PAUSE, SWEEP, SONAR, PET, POOL, BDAYDEMO, AP, FETCH, STATUS, SCAN, FORGET, WEBTEST\n");
+        printf("commands: SSID, PASS, KEY, CITY, LOC, DRINK, MOVE, QUIET, TZ, MODE, EXPR, BNAME, BDAY, BAUTO, MSG, PAUSE, SWEEP, SONAR, PET, POOL, BDAYDEMO, AP, FETCH, STATUS, SCAN, FORGET, WEBTEST, ASSETS\n");
         fflush(stdout);
     }
 }

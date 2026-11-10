@@ -1,6 +1,2 @@
-# Extra glyphs beyond GB2312 level 1, so names typed on the settings page
-# render. Traditional / variant characters common in Chinese given names and
-# surnames. One or more characters per line; '#' lines are comments.
-粵廣華國麗偉傑慧穎婷琳曉鳳龍雲嘉寶樂愛誠東陳張劉黃吳鄭楊趙錢孫馮葉蘇盧蔣鍾許鄧韓謝羅
-馬齊鄒賴蕭潘譚區傅歐陽諸葛紀鄺溫湯鍾萬嚴莊顏鐘龔聶靜儀瑩婉麗嬌娟姍綺瑤璐璇瓊霞潔濤鴻
-鵬鑫輝軍強偉剛勝榮達澤瀚懷穎賢慶興順權譽禎銘錦鎮閔陸韋顧馮騰驍鷹凱勳啟執聰凝憶戀
+# v1.0 keeps the simplified GB2312 level-1 set only. Traditional name
+# characters used to live here; a character outside the set draws as "?".

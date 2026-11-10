@@ -272,9 +272,9 @@ def layout_bubble(text, advances):
 
 WISH_RE = re.compile(r'BIRTHDAY_WISHES\[\] = \{(.*?)\};', re.S)
 # Worst-case name for the birthday wish check: three full-width hanzi.
-WISH_TEST_NAME = "國國國"
+WISH_TEST_NAME = "国国国"
 
-QUOTE_RE = re.compile(r'\{\s*T_[A-Z]+\s*,\s*C_[A-Z]+\s*,\s*"((?:\\.|[^"\\])*)"\s*\}')
+QUOTE_RE = re.compile(r'\{\s*T_[A-Z]+\s*,\s*C_[A-Z]+\s*,\s*EXPR_[A-Z]+\s*,\s*"((?:\\.|[^"\\])*)"\s*\}')
 # Widest values the device can put into {temp} / {weather} at display time.
 FILL_TEMP = "-10°C"
 FILL_WEATHER = "雷阵雨"

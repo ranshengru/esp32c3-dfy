@@ -3,6 +3,7 @@
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
 #include "net.h"
+#include "assets.h"
 #include "sonar.h"
 
 #include <stdarg.h>
@@ -154,7 +155,7 @@ static void build_page(const NetSnapshot *snap)
            "border-radius:14px;padding:14px;font-size:16px;font-weight:600;font-family:inherit;color:#fff;background:var(--navy);box-shadow:0 8px 20px rgba(31,42,107,.3)}</style>");
 
     // Status header.
-    append("<main><section class=\"hero\"><h1>桌宠<span class=\"v\">v0.5</span></h1>");
+    append("<main><section class=\"hero\"><h1>桌宠<span class=\"v\">v1.0</span></h1>");
     append("<div class=\"big\"><b>%s</b><span>%s%s%s</span></div>", snap->time_ok ? snap->clock : "--:--",
            weather[0] ? weather : "天气未加载", city[0] ? " · " : "", city);
     append("<div class=\"chips\"><span class=\"chip %s\">%s %s</span><span class=\"chip\">%s</span><span class=\"chip\">%s</span>%s</div></section>",
@@ -174,6 +175,12 @@ static void build_page(const NetSnapshot *snap)
     append("<label class=\"f\"><span>生日 · 日</span><input name=\"bd\" type=\"number\" min=\"0\" max=\"31\" value=\"%d\"></label></div>", snap->bday);
     toggle("bauto", snap->bauto, "生日当天自动切换", "当天自动进入生日派对，第二天回到陪伴模式");
     append("<label class=\"f\"><span>屏幕留言（留空清除）</span><input name=\"msg\" maxlength=\"13\" value=\"%s\" placeholder=\"显示在时间卡片下方\"></label></section>", msg);
+
+    append("<section class=\"card\"><h2>形象</h2><div class=\"seg\">"
+           "<label><input type=\"radio\" name=\"expr\" value=\"0\"%s><span>经典</span></label>"
+           "<label><input type=\"radio\" name=\"expr\" value=\"1\"%s><span>表情</span></label></div>",
+           snap->expr_on ? "" : " checked", snap->expr_on ? " checked" : "");
+    append("<p class=\"note\">%s。默认经典。表情包缺失时仍显示内置立绘。</p></section>", snap->assets);
 
     // 天气位置
     append("<section class=\"card\"><h2>天气位置</h2>");
@@ -237,12 +244,12 @@ static esp_err_t status_get(httpd_req_t *req)
 {
     NetSnapshot snap;
     net_snapshot(&snap);
-    char out[512];
+    char out[640];
     snprintf(out, sizeof(out),
-             "{\"version\":\"v0.5\",\"connected\":%s,\"ip\":\"%s\",\"mode\":%d,\"birthday_now\":%s,"
+             "{\"version\":\"v1.0\",\"connected\":%s,\"ip\":\"%s\",\"mode\":%d,\"expr\":%d,\"birthday_now\":%s,"
              "\"days_to_birthday\":%d,\"weather_ok\":%s,\"llm_today\":%d,\"llm_cap\":%d,"
              "\"ap\":%s,\"heap\":%u,\"heap_min\":%u,\"uptime\":%u}",
-             snap.connected ? "true" : "false", snap.ip, snap.mode, snap.birthday_now ? "true" : "false",
+             snap.connected ? "true" : "false", snap.ip, snap.mode, snap.expr_on, snap.birthday_now ? "true" : "false",
              snap.days_to_birthday, snap.weather[0] ? "true" : "false", snap.llm_today, snap.llm_cap,
              snap.ap_active ? "true" : "false", snap.heap_free, snap.heap_min, snap.uptime_s);
     httpd_resp_set_type(req, "application/json");
@@ -345,8 +352,8 @@ static esp_err_t save_post(httpd_req_t *req)
     bool saw_city = false, bad_num = false, bad_pass = false;
     int drink = now.drink_min, move = now.move_min, q0 = now.quiet_start, q1 = now.quiet_end, tz = now.tz_hours;
     bool saw_nums = false;
-    bool v5 = false, saw_mode = false, bauto = false, rpause = false, saw_msg = false, saw_bname = false;
-    int mode = 0, bm = now.bmonth, bd = now.bday, sweep_cm = 0;
+    bool v5 = false, saw_mode = false, bauto = false, rpause = false, saw_msg = false, saw_bname = false, saw_expr = false;
+    int mode = 0, bm = now.bmonth, bd = now.bday, sweep_cm = 0, expr = now.expr_on;
     char lat[20] = {0}, lon[20] = {0};
     static char bname[32];
     static char msg[40];
@@ -394,6 +401,8 @@ static esp_err_t save_post(httpd_req_t *req)
             v5 = true;
         } else if (!strcmp(pair, "mode")) {
             saw_mode = num_field(eq, 0, 1, &mode, &bad_num);
+        } else if (!strcmp(pair, "expr")) {
+            saw_expr = num_field(eq, 0, 1, &expr, &bad_num);
         } else if (!strcmp(pair, "bname")) {
             copy_trim(bname, sizeof(bname), eq);
             saw_bname = true;
@@ -449,6 +458,8 @@ static esp_err_t save_post(httpd_req_t *req)
     if (v5) {
         if (saw_mode)
             net_set_mode(mode);
+        if (saw_expr)
+            net_set_expr(expr);
         if (saw_bname)
             net_set_birthday(bname, (bm && bd) ? bm : 0, (bm && bd) ? bd : 0, bauto);
         if (saw_msg)

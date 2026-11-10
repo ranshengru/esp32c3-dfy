@@ -1,6 +1,8 @@
 #ifndef COMPANION_QUOTES_H
 #define COMPANION_QUOTES_H
 
+#include "mood.h"
+
 #include <stdint.h>
 
 // 20 seed lines for the single-sweep bubble, in the voice of 大肥鱼. More come
@@ -23,30 +25,31 @@ static const char *const C_NAMES[C_COUNT] = {"general", "rain", "hot", "cold", "
 typedef struct {
     uint8_t time;
     uint8_t cond;
+    uint8_t mood;
     const char *text;
 } PetQuote;
 
 static const PetQuote PET_QUOTES[] = {
-    {T_MORNING, C_GENERAL, "早上好呀，本鱼醒得好早。"},
-    {T_MORNING, C_GENERAL, "眼罩推上去啦，本鱼正式开机。"},
-    {T_MORNING, C_COLD, "早上才{temp}，起床多穿点哦。"},
-    {T_NOON, C_GENERAL, "中午啦，主人吃饭了没有呀？"},
-    {T_NOON, C_GENERAL, "本鱼想吃白饭，配红烧肉。"},
-    {T_AFTERNOON, C_GENERAL, "下午好困呀，一起摸会儿鱼？"},
-    {T_EVENING, C_GENERAL, "今天也辛苦你啦 (｡•ᴗ-)✧"},
-    {T_NIGHT, C_CLEAR, "今晚天气晴，想和你看星星。"},
-    {T_LATE, C_GENERAL, "这么晚了，主人该睡觉了哦。"},
-    {T_LATE, C_GENERAL, "本鱼困了，晚安啦 ´-ω-`"},
-    {T_ANY, C_RAIN, "外面{weather}，出门记得带伞。"},
-    {T_ANY, C_HOT, "现在{temp}，本鱼快被清蒸了。"},
-    {T_ANY, C_COLD, "才{temp}呀，多穿一件外套吧。"},
-    {T_ANY, C_WEEKEND, "周末啦，多睡一会儿吧。"},
-    {T_ANY, C_GENERAL, "摸到我啦，本鱼有点开心。"},
-    {T_ANY, C_GENERAL, "清蒸还是红烧？都不要啦！"},
-    {T_ANY, C_GENERAL, "服务器繁忙，请稍后再摸我。"},
-    {T_ANY, C_GENERAL, "本鱼不是笨，是在深度思考。"},
-    {T_ANY, C_GENERAL, "被发现在偷懒了 (´・ω・`)"},
-    {T_ANY, C_GENERAL, "哼，我才没有在等你呢。"},
+    {T_MORNING, C_GENERAL, EXPR_HAPPY, "早上好呀，本鱼醒得好早。"},
+    {T_MORNING, C_GENERAL, EXPR_NEUTRAL, "眼罩推上去啦，本鱼正式开机。"},
+    {T_MORNING, C_COLD, EXPR_WORRIED, "早上才{temp}，起床多穿点哦。"},
+    {T_NOON, C_GENERAL, EXPR_HAPPY, "中午啦，主人吃饭了没有呀？"},
+    {T_NOON, C_GENERAL, EXPR_HAPPY, "本鱼想吃白饭，配红烧肉。"},
+    {T_AFTERNOON, C_GENERAL, EXPR_SLEEPY, "下午好困呀，一起摸会儿鱼？"},
+    {T_EVENING, C_GENERAL, EXPR_HAPPY, "今天也辛苦你啦 (｡•ᴗ-)✧"},
+    {T_NIGHT, C_CLEAR, EXPR_HAPPY, "今晚天气晴，想和你看星星。"},
+    {T_LATE, C_GENERAL, EXPR_SLEEPING, "这么晚了，主人该睡觉了哦。"},
+    {T_LATE, C_GENERAL, EXPR_SLEEPY, "本鱼困了，晚安啦 ´-ω-`"},
+    {T_ANY, C_RAIN, EXPR_WORRIED, "外面{weather}，出门记得带伞。"},
+    {T_ANY, C_HOT, EXPR_SLEEPY, "现在{temp}，本鱼快被清蒸了。"},
+    {T_ANY, C_COLD, EXPR_WORRIED, "才{temp}呀，多穿一件外套吧。"},
+    {T_ANY, C_WEEKEND, EXPR_SLEEPY, "周末啦，多睡一会儿吧。"},
+    {T_ANY, C_GENERAL, EXPR_HAPPY, "摸到我啦，本鱼有点开心。"},
+    {T_ANY, C_GENERAL, EXPR_TSUNDERE, "清蒸还是红烧？都不要啦！"},
+    {T_ANY, C_GENERAL, EXPR_TSUNDERE, "服务器繁忙，请稍后再摸我。"},
+    {T_ANY, C_GENERAL, EXPR_NEUTRAL, "本鱼不是笨，是在深度思考。"},
+    {T_ANY, C_GENERAL, EXPR_TSUNDERE, "被发现在偷懒了 (´・ω・`)"},
+    {T_ANY, C_GENERAL, EXPR_TSUNDERE, "哼，我才没有在等你呢。"},
 };
 
 #define PET_QUOTE_COUNT ((int)(sizeof(PET_QUOTES) / sizeof(PET_QUOTES[0])))

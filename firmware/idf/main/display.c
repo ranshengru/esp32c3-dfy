@@ -30,6 +30,7 @@ static uint16_t fb[WIDTH * HEIGHT];
 
 extern const uint8_t idle_rgb565_start[] asm("_binary_idle_rgb565_start");
 extern const uint8_t idle_rgb565_end[] asm("_binary_idle_rgb565_end");
+static const uint8_t *g_portrait;
 
 static void spi_bytes(const uint8_t *data, int len)
 {
@@ -458,8 +459,9 @@ static const Pose bounce[] = {
 
 static void paint_portrait(const Pose *pose)
 {
+    const uint8_t *src = g_portrait ? g_portrait : idle_rgb565_start;
     size_t expect = WIDTH * HEIGHT * 2;
-    size_t have = (size_t)(idle_rgb565_end - idle_rgb565_start);
+    size_t have = g_portrait ? expect : (size_t)(idle_rgb565_end - idle_rgb565_start);
     if (have < expect) {
         for (int i = 0; i < WIDTH * HEIGHT; ++i)
             fb[i] = WHITE;
@@ -486,7 +488,7 @@ static void paint_portrait(const Pose *pose)
                 continue;
             }
             unsigned at = (unsigned)(memory_y * WIDTH + (WIDTH - 1 - sx)) * 2;
-            out[vx] = ((uint16_t)idle_rgb565_start[at] << 8) | idle_rgb565_start[at + 1];
+            out[vx] = ((uint16_t)src[at] << 8) | src[at + 1];
         }
     }
 }
@@ -1120,6 +1122,11 @@ void display_show(const UiState *ui)
 int display_anim_frames(void)
 {
     return (int)(sizeof(bounce) / sizeof(bounce[0]));
+}
+
+void display_set_portrait(const uint8_t *be_rgb565)
+{
+    g_portrait = be_rgb565;
 }
 
 void display_anim_frame(const UiState *ui, int frame)

@@ -35,6 +35,9 @@ typedef struct {
     bool candles_out;
     uint32_t fx_seq;   // bump: play fireworks
     uint32_t blow_seq; // bump: blow out candles, then fireworks + wish
+    // v1.0 expression mode. Off (the default) draws the built-in portrait.
+    bool expr_on;
+    uint8_t expr;
 } UiState;
 
 enum { PARTY_IDLE, PARTY_BLOW, PARTY_FIREWORKS, PARTY_SHOW };
@@ -58,5 +61,8 @@ void display_party_frame(const UiState *ui, int fx, int frame, uint32_t tick);
 // bubble stays still, as in v0.1).
 int display_anim_frames(void);
 void display_anim_frame(const UiState *ui, int frame);
+// NULL keeps the built-in portrait. Otherwise a 128x160 big-endian RGB565
+// buffer already rotated 180 degrees, same layout as idle.rgb565.
+void display_set_portrait(const uint8_t *be_rgb565);
 
 #endif

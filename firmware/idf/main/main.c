@@ -1,4 +1,5 @@
 #include "display.h"
+#include "assets.h"
 #include "net.h"
 #include "sonar.h"
 
@@ -34,6 +35,36 @@ static void console_task(void *arg)
     }
 }
 
+static int g_face_expr = -1;
+static int g_face_frame;
+static int64_t g_face_us;
+
+static bool apply_face(const UiState *ui)
+{
+    if (!ui->expr_on) {
+        display_set_portrait(0);
+        g_face_expr = -1;
+        return false;
+    }
+    int frames = assets_frames(ui->expr);
+    int64_t now = esp_timer_get_time();
+    int before = g_face_frame;
+    if (frames < 1) {
+        display_set_portrait(0);
+        return false;
+    }
+    if ((int)ui->expr != g_face_expr) {
+        g_face_expr = ui->expr;
+        g_face_frame = 0;
+        g_face_us = now;
+    } else if (frames > 1 && now - g_face_us >= 450000) {
+        g_face_frame = (g_face_frame + 1) % frames;
+        g_face_us = now;
+    }
+    display_set_portrait(assets_frame(ui->expr, g_face_frame));
+    return g_face_frame != before;
+}
+
 static void ui_task(void *arg)
 {
     (void)arg;
@@ -45,6 +76,7 @@ static void ui_task(void *arg)
     for (;;) {
         UiState current;
         net_compose(&current);
+        bool face_tick = apply_face(&current);
         if (first) {
             played = current.anim_seq;
             blow_played = current.blow_seq;
@@ -116,7 +148,7 @@ static void ui_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        if (memcmp(&current, &previous, sizeof(current))) {
+        if (memcmp(&current, &previous, sizeof(current)) || face_tick) {
             display_show(&current);
             previous = current;
         }
@@ -128,6 +160,7 @@ void app_main(void)
 {
     setvbuf(stdin, NULL, _IONBF, 0);
     display_init();
+    assets_init();
     net_init();
     xTaskCreate(ui_task, "ui", 6144, 0, 4, 0);
     sonar_start();

@@ -54,6 +54,8 @@ typedef struct {
     int llm_cap;
     bool ap_active;
     char ap_ssid[24];
+    int expr_on;
+    char assets[80];
     unsigned heap_free;
     unsigned heap_min;
     unsigned uptime_s;
@@ -84,6 +86,7 @@ void net_snapshot(NetSnapshot *out);
 // v0.5 settings shared by the web page and USB serial. All persist in NVS.
 bool net_set_location(int lat_e6, int lon_e6, const char *name);
 void net_set_mode(int mode);
+void net_set_expr(int on);
 bool net_set_birthday(const char *name, int month, int day, bool auto_switch);
 void net_set_message(const char *text);
 void net_set_pause(bool paused);
