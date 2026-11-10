@@ -938,13 +938,20 @@ static void flush_frame(void)
             row[2 * memory_x + 1] = color & 0xff;
         }
     }
-    spi_transaction_t tx = {
-        .length = (size_t)WIDTH * HEIGHT * 16,
-        .tx_buffer = dma_buf,
-    };
-    ESP_ERROR_CHECK(spi_device_queue_trans(spi, &tx, portMAX_DELAY));
-    spi_transaction_t *done = 0;
-    ESP_ERROR_CHECK(spi_device_get_trans_result(spi, &done, portMAX_DELAY));
+    // ESP32-C3 SPI DMA moves at most 32 KB (2^18 bits) per transaction, and a
+    // full frame is 40,960 bytes, so send it in two 80-row halves while CS
+    // stays low. Same DMA buffer, same clock; just two bursts instead of one.
+    const int chunk_rows = HEIGHT / 2;
+    for (int first = 0; first < HEIGHT; first += chunk_rows) {
+        int rows = HEIGHT - first < chunk_rows ? HEIGHT - first : chunk_rows;
+        spi_transaction_t tx = {
+            .length = (size_t)WIDTH * rows * 16,
+            .tx_buffer = dma_buf + (size_t)first * WIDTH * 2,
+        };
+        ESP_ERROR_CHECK(spi_device_queue_trans(spi, &tx, portMAX_DELAY));
+        spi_transaction_t *done = 0;
+        ESP_ERROR_CHECK(spi_device_get_trans_result(spi, &done, portMAX_DELAY));
+    }
     gpio_set_level(PIN_CS, 1);
 }
 

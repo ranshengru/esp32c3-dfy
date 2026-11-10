@@ -106,6 +106,41 @@ static int g_force_expr = -1;
 static int64_t g_force_until_us;
 static bool g_cycle;
 static int g_face = EXPR_NEUTRAL;
+
+// Consecutive sentences should not show the same face. If the new line's mood
+// matches the previous line's, swap in a close neighbour that the pack has.
+static int g_last_line_mood = -1;
+static const uint8_t LINE_MOOD_ALT[EXPR_COUNT][3] = {
+    [EXPR_NEUTRAL] = {EXPR_HAPPY, EXPR_SURPRISED, EXPR_TSUNDERE},
+    [EXPR_HAPPY] = {EXPR_EXCITED, EXPR_SURPRISED, EXPR_NEUTRAL},
+    [EXPR_SLEEPY] = {EXPR_SLEEPING, EXPR_NEUTRAL, EXPR_SLEEPING},
+    [EXPR_SLEEPING] = {EXPR_SLEEPY, EXPR_NEUTRAL, EXPR_SLEEPY},
+    [EXPR_TSUNDERE] = {EXPR_NEUTRAL, EXPR_SURPRISED, EXPR_HAPPY},
+    [EXPR_SURPRISED] = {EXPR_EXCITED, EXPR_HAPPY, EXPR_NEUTRAL},
+    [EXPR_WORRIED] = {EXPR_SURPRISED, EXPR_NEUTRAL, EXPR_TSUNDERE},
+    [EXPR_EXCITED] = {EXPR_HAPPY, EXPR_SURPRISED, EXPR_NEUTRAL},
+    [EXPR_RICE] = {EXPR_HAPPY, EXPR_EXCITED, EXPR_NEUTRAL},
+};
+_Static_assert(EXPR_COUNT == 9, "LINE_MOOD_ALT needs a row for every expression");
+
+
+static int line_mood_vary(int mood)
+{
+    if (mood < 0 || mood >= EXPR_COUNT)
+        mood = EXPR_NEUTRAL;
+    if (mood == g_last_line_mood) {
+        int pick[3], n = 0;
+        for (int i = 0; i < 3; ++i) {
+            int alt = LINE_MOOD_ALT[mood][i];
+            if (alt != g_last_line_mood && (assets_has(alt) || !assets_expr_count()))
+                pick[n++] = alt;
+        }
+        if (n)
+            mood = pick[esp_random() % n];
+    }
+    g_last_line_mood = mood;
+    return mood;
+}
 static char g_face_reason[24] = "idle";
 static char g_bname[32];
 static int g_bmonth;
@@ -1026,6 +1061,7 @@ static void show_phrase_locked(void)
         g_phrase_mood = mood_from_text(filled);
     if (g_phrase_mood >= EXPR_COUNT)
         g_phrase_mood = EXPR_NEUTRAL;
+    g_phrase_mood = line_mood_vary(g_phrase_mood);
     g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
     *pool_used(id) = 1;
     g_recent[g_recent_pos] = id;
@@ -2566,41 +2602,59 @@ void net_compose(UiState *ui)
             } else if (late || afternoon) {
                 cand[n++] = EXPR_SLEEPY;
                 cand[n++] = EXPR_NEUTRAL;
+                cand[n++] = EXPR_TSUNDERE;
                 reason = "drowsy";
             }
             if (rain) {
                 cand[n++] = EXPR_WORRIED;
                 cand[n++] = EXPR_NEUTRAL;
+                cand[n++] = EXPR_SURPRISED;
                 reason = "rain";
             }
             if (hot) {
                 cand[n++] = EXPR_SLEEPY;
                 cand[n++] = EXPR_NEUTRAL;
+                cand[n++] = EXPR_TSUNDERE;
                 reason = "hot";
             }
             if (cold) {
                 cand[n++] = EXPR_WORRIED;
                 cand[n++] = EXPR_NEUTRAL;
+                cand[n++] = EXPR_SURPRISED;
                 reason = "cold";
             }
             if (meal) {
+                // Rice listed twice: at meal time it is the most likely face, and
+                // the no-repeat rule below still alternates it with happy/excited.
+                cand[n++] = EXPR_RICE;
                 cand[n++] = EXPR_RICE;
                 cand[n++] = EXPR_HAPPY;
+                cand[n++] = EXPR_EXCITED;
                 reason = "meal";
             }
             if (!n) {
-                cand[n++] = EXPR_NEUTRAL;
                 cand[n++] = EXPR_HAPPY;
                 cand[n++] = EXPR_NEUTRAL;
+                cand[n++] = EXPR_TSUNDERE;
+                cand[n++] = EXPR_SURPRISED;
+                cand[n++] = EXPR_EXCITED;
+                cand[n++] = EXPR_SLEEPY;
                 reason = "idle";
             }
             int usable = 0;
             for (int i = 0; i < n; ++i)
                 if (assets_has(cand[i]) || !assets_expr_count())
                     cand[usable++] = cand[i];
+            // Don't repeat the previous idle face when anything else is usable.
+            int fresh = 0;
+            for (int i = 0; i < usable; ++i)
+                if (cand[i] != g_idle_expr)
+                    cand[fresh++] = cand[i];
+            if (fresh)
+                usable = fresh;
             face = usable ? cand[esp_random() % usable] : EXPR_NEUTRAL;
             g_idle_expr = face;
-            g_idle_until_us = now_us + 60 * 1000000LL;
+            g_idle_until_us = now_us + 30 * 1000000LL;
         }
         if (face < 0 || face >= EXPR_COUNT)
             face = EXPR_NEUTRAL;
