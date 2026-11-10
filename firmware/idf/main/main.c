@@ -152,7 +152,16 @@ static void ui_task(void *arg)
             display_show(&current);
             previous = current;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
+        // Sleep until the next face frame is due, but wake at least every
+        // 100ms so a sweep or the clock is not stuck behind a long hold.
+        int wait_ms = 100;
+        if (current.expr_on && g_face_expr == (int)current.expr) {
+            int64_t due = g_face_us + (int64_t)assets_hold_ms(current.expr, g_face_frame) * 1000;
+            int left = (int)((due - esp_timer_get_time()) / 1000);
+            if (left < wait_ms)
+                wait_ms = left > 1 ? left : 1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(wait_ms));
     }
 }
 

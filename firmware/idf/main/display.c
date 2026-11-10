@@ -4,7 +4,6 @@
 
 #include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -30,6 +29,9 @@ enum {
 static const char *TAG = "display";
 static spi_device_handle_t spi;
 static uint16_t fb[WIDTH * HEIGHT];
+// One DMA buffer. The bounce path borrows it as RGB565 before the portrait is
+// copied into fb; flush then reuses it as the big-endian bytes on the wire.
+static uint8_t dma_buf[WIDTH * HEIGHT * 2];
 
 extern const uint8_t idle_rgb565_start[] asm("_binary_idle_rgb565_start");
 extern const uint8_t idle_rgb565_end[] asm("_binary_idle_rgb565_end");
@@ -86,15 +88,15 @@ static void panel_init(void)
         .sclk_io_num = PIN_CLOCK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 1024,
+        .max_transfer_sz = WIDTH * HEIGHT * 2,
     };
     // The panel sends 256-byte rows. With DMA disabled the ESP32-C3 SPI
     // driver's host limit is only 64 bytes, so enable DMA for these transfers.
     ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
     spi_device_interface_config_t dev = {
-        // v0.1 drove this panel at APB/3 (26.7 MHz); 20 MHz keeps margin
-        // and lets the bounce run near v0.1 speed.
-        .clock_speed_hz = 20000000,
+        // v0.1 drove this panel at APB/3 (26.7 MHz). One DMA burst replaces
+        // 160 separate row transactions, so the old margin is no longer needed.
+        .clock_speed_hz = 26666667,
         .mode = 0,
         .spics_io_num = -1,
         .queue_size = 1,
@@ -492,13 +494,10 @@ static bool paint_clip(const Pose *pose)
     bool plain = pose->width == 100 && pose->height == 100;
     if (plain)
         return assets_blit(g_clip_expr, g_clip_frame, fb);
-    uint16_t *scratch = malloc((size_t)WIDTH * HEIGHT * sizeof(uint16_t));
-    if (!scratch)
-        return assets_blit(g_clip_expr, g_clip_frame, fb);
+    uint16_t *scratch = (uint16_t *)dma_buf;
     bool ok = assets_blit(g_clip_expr, g_clip_frame, scratch);
     if (ok)
         paint_from_rgb(scratch, pose);
-    free(scratch);
     return ok;
 }
 
@@ -930,16 +929,22 @@ static void flush_frame(void)
     spi_bytes(&opcode, 1);
     gpio_set_level(PIN_DC, 1);
 
-    uint8_t row[WIDTH * 2];
     for (int memory_y = 0; memory_y < HEIGHT; ++memory_y) {
         int visual_y = HEIGHT - 1 - memory_y;
+        uint8_t *row = dma_buf + (size_t)memory_y * WIDTH * 2;
         for (int memory_x = 0; memory_x < WIDTH; ++memory_x) {
             uint16_t color = fb[visual_y * WIDTH + (WIDTH - 1 - memory_x)];
             row[2 * memory_x] = color >> 8;
             row[2 * memory_x + 1] = color & 0xff;
         }
-        spi_bytes(row, sizeof(row));
     }
+    spi_transaction_t tx = {
+        .length = (size_t)WIDTH * HEIGHT * 16,
+        .tx_buffer = dma_buf,
+    };
+    ESP_ERROR_CHECK(spi_device_queue_trans(spi, &tx, portMAX_DELAY));
+    spi_transaction_t *done = 0;
+    ESP_ERROR_CHECK(spi_device_get_trans_result(spi, &done, portMAX_DELAY));
     gpio_set_level(PIN_CS, 1);
 }
 

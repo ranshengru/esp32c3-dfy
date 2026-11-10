@@ -150,36 +150,51 @@ def pick_indices(frames):
     return ordered, n
 
 
-def grab(video, index, dest):
+def grab_frames(video, indices, dest_dir):
+    """One decode of the source. select= keeps the chosen frames in order."""
+    if dest_dir.exists():
+        subprocess.check_call(["rm", "-rf", str(dest_dir)])
+    dest_dir.mkdir(parents=True)
+    choose = "+".join(f"eq(n\\,{index})" for index in indices)
     subprocess.check_call(
         [
             "ffmpeg", "-y", "-i", str(video),
-            "-vf", f"select=eq(n\\,{index})",
-            "-vsync", "vfr", "-frames:v", "1", str(dest),
+            "-vf", f"select='{choose}',setpts=N/FRAME_RATE/TB",
+            "-vsync", "vfr", str(dest_dir / "f_%02d.png"),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    frames = sorted(dest_dir.glob("f_*.png"))
+    if len(frames) != len(indices):
+        raise SystemExit(f"{video.name}: grabbed {len(frames)} frames, wanted {len(indices)}")
+    return frames
 
 
-def encode_jpeg(canvas, dest):
-    png = dest.with_suffix(".png")
-    canvas.save(png)
+def encode_jpegs(canvases, dest_dir):
+    """One ffmpeg for the whole clip. -q:v 5 stays; q:v 8 blocks the eyes."""
+    if dest_dir.exists():
+        subprocess.check_call(["rm", "-rf", str(dest_dir)])
+    dest_dir.mkdir(parents=True)
+    for i, canvas in enumerate(canvases):
+        canvas.save(dest_dir / f"f_{i:02d}.png")
     subprocess.check_call(
         [
-            "ffmpeg", "-y", "-i", str(png),
+            "ffmpeg", "-y", "-start_number", "0", "-i", str(dest_dir / "f_%02d.png"),
             "-c:v", "mjpeg", "-q:v", str(QV), "-pix_fmt", "yuvj420p",
-            "-frames:v", "1", str(dest),
+            str(dest_dir / "o_%02d.jpg"),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    png.unlink()
-    data = dest.read_bytes()
-    dest.unlink()
-    if not data.startswith(b"\xff\xd8") or not is_baseline(data) or len(data) > 20 * 1024:
-        raise SystemExit(f"bad jpeg ({len(data)} bytes)")
-    return data
+    out = []
+    for i in range(len(canvases)):
+        data = (dest_dir / f"o_{i:02d}.jpg").read_bytes()
+        if not data.startswith(b"\xff\xd8") or not is_baseline(data) or len(data) > 20 * 1024:
+            raise SystemExit(f"bad jpeg frame {i} ({len(data)} bytes)")
+        out.append(data)
+    subprocess.check_call(["rm", "-rf", str(dest_dir)])
+    return out
 
 
 def main():
@@ -197,6 +212,16 @@ def main():
         duration = total / SRC_FPS
         times = [i / SRC_FPS for i in indices]
         print(f"{key}: {total} src frames -> {indices}")
+        grabbed = grab_frames(video, indices, Path(f"/tmp/grab-{key}"))
+        canvases = []
+        heights = []
+        for full in grabbed:
+            canvas = screen_canvas(Image.open(full))
+            cropped, frame_h = tight_crop(canvas)
+            canvases.append((canvas, cropped))
+            heights.append(frame_h)
+        jpegs = encode_jpegs([cropped for _, cropped in canvases], Path(f"/tmp/enc-{key}"))
+        subprocess.check_call(["rm", "-rf", f"/tmp/grab-{key}"])
         row = []
         for frame_i, (index, t) in enumerate(zip(indices, times)):
             if frame_i + 1 < len(times):
@@ -206,17 +231,13 @@ def main():
             else:
                 nxt = t + 1 / SRC_FPS
             hold_ms = max(40, int(round((nxt - t) * 1000)))
-            full = Path(f"/tmp/grab-{key}-{frame_i}.png")
-            grab(video, index, full)
-            canvas = screen_canvas(Image.open(full))
-            full.unlink()
-            cropped, frame_h = tight_crop(canvas)
-            jpeg = encode_jpeg(cropped, Path(f"/tmp/enc-{key}-{frame_i}.jpg"))
+            canvas, _cropped = canvases[frame_i]
+            jpeg = jpegs[frame_i]
             entries.append((expr_id, frame_i, hold_ms, jpeg))
             if frame_i == 0:
                 previews.append((label, canvas))
             row.append(canvas)
-            print(f"  [{frame_i:02d}] src {index} hold {hold_ms}ms h {frame_h} jpeg {len(jpeg)}")
+            print(f"  [{frame_i:02d}] src {index} hold {hold_ms}ms h {heights[frame_i]} jpeg {len(jpeg)}")
         strips.append((label, row))
 
     directory = bytearray()
@@ -282,7 +303,6 @@ def main():
         for i, canvas in enumerate(row):
             film.paste(canvas.resize((thumb_w, thumb_h), Image.Resampling.NEAREST), (i * thumb_w, y + 20))
     film.save(SHEET)
-    film.save("/workspace/artifacts/frames24.png")
     print(f"wrote {PREVIEW} and {SHEET}")
 
 

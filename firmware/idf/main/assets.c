@@ -8,7 +8,8 @@
 #include "esp_partition.h"
 #include "esp_rom_crc.h"
 
-enum { WIDTH = 128, HEIGHT = 160, ENTRY_MAX = 256, FORMAT_VIDEO = 4, JPEG_MAX = 20 * 1024 };
+enum { WIDTH = 128, HEIGHT = 160, EXPR_MAX = 8, FRAME_MAX = 24, ENTRY_MAX = 256, FORMAT_VIDEO = 4,
+      JPEG_MAX = 20 * 1024 };
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -47,6 +48,8 @@ static const uint8_t *g_map;
 static esp_partition_mmap_handle_t g_map_handle;
 static bool g_ready;
 static uint8_t g_jpeg_pool[4096];
+static const AssetEntry *g_index[EXPR_MAX][FRAME_MAX];
+static uint8_t g_nframes[EXPR_MAX];
 
 typedef struct {
     const uint8_t *data;
@@ -76,6 +79,8 @@ void assets_init(void)
     g_ready = false;
     g_count = 0;
     g_map = 0;
+    memset(g_index, 0, sizeof(g_index));
+    memset(g_nframes, 0, sizeof(g_nframes));
     g_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "assets");
     if (!g_part) {
         set_line("assets missing");
@@ -99,35 +104,52 @@ void assets_init(void)
         ESP_LOGW(TAG, "%s", g_line);
         return;
     }
-    // Whole partition is 64KB-aligned, so the flash cache can map it. Pixels
-    // stay in flash; nothing is copied into RAM.
+    // Map only the bytes the pack uses, rounded up to the 64KB cache page.
+    size_t need = (size_t)header.header_size + header.data_size;
+    if (need > g_part->size) {
+        set_line("assets truncated");
+        return;
+    }
+    size_t map_len = (need + 0xffffu) & ~0xffffu;
+    if (map_len > g_part->size)
+        map_len = g_part->size;
     const void *mapped = 0;
-    if (esp_partition_mmap(g_part, 0, g_part->size, ESP_PARTITION_MMAP_DATA, &mapped, &g_map_handle) != ESP_OK ||
+    if (esp_partition_mmap(g_part, 0, map_len, ESP_PARTITION_MMAP_DATA, &mapped, &g_map_handle) != ESP_OK ||
         !mapped) {
         set_line("assets map failed");
         ESP_LOGW(TAG, "%s", g_line);
         return;
     }
     g_map = mapped;
-    if (header.data_size > g_part->size - header.header_size ||
-        esp_rom_crc32_le(0, g_map + header.header_size, header.data_size) != header.data_crc) {
-        set_line("assets bad crc");
-        ESP_LOGW(TAG, "%s", g_line);
-        return;
-    }
     g_entries = (const AssetEntry *)(g_map + header.header_size);
+    memset(g_index, 0, sizeof(g_index));
+    memset(g_nframes, 0, sizeof(g_nframes));
     int bad = 0;
     for (unsigned i = 0; i < header.entry_count; ++i) {
         const AssetEntry *e = &g_entries[i];
-        if (e->expr >= 8 || e->size < 32 || e->size > JPEG_MAX || e->offset + e->size > g_part->size)
+        if (e->expr >= EXPR_MAX || e->frame >= FRAME_MAX || e->size < 32 || e->size > JPEG_MAX ||
+            e->offset < header.header_size || e->offset > need || e->size > need - e->offset ||
+            g_index[e->expr][e->frame]) {
             ++bad;
+            continue;
+        }
+        g_index[e->expr][e->frame] = e;
+    }
+    for (int expr = 0; expr < EXPR_MAX; ++expr) {
+        int n = 0;
+        while (n < FRAME_MAX && g_index[expr][n])
+            ++n;
+        for (int frame = n; frame < FRAME_MAX; ++frame)
+            if (g_index[expr][frame])
+                ++bad; // a hole, so frame % count would show the wrong pose
+        g_nframes[expr] = (uint8_t)n;
     }
     g_count = (int)header.entry_count;
     g_version = header.pack_version;
     g_ready = bad == 0;
     int faces = 0;
-    for (int expr = 0; expr < 8; ++expr)
-        faces += assets_has(expr);
+    for (int expr = 0; expr < EXPR_MAX; ++expr)
+        faces += g_nframes[expr] > 0;
     snprintf(g_line, sizeof(g_line), "assets %s v%lu clips %d/8 frames %d mjpeg", g_ready ? "ok" : "partial",
              (unsigned long)g_version, faces, g_count);
     ESP_LOGI(TAG, "%s", g_line);
@@ -135,19 +157,16 @@ void assets_init(void)
 
 int assets_frames(int expr)
 {
-    int n = 0;
-    for (int i = 0; i < g_count; ++i)
-        if (g_entries[i].expr == expr)
-            ++n;
-    return n;
+    if (expr < 0 || expr >= EXPR_MAX)
+        return 0;
+    return g_nframes[expr];
 }
 
 int assets_hold_ms(int expr, int frame)
 {
-    for (int i = 0; i < g_count; ++i)
-        if (g_entries[i].expr == expr && g_entries[i].frame == frame)
-            return g_entries[i].hold_ms ? g_entries[i].hold_ms : 450;
-    return 450;
+    if (expr < 0 || expr >= EXPR_MAX || frame < 0 || frame >= FRAME_MAX || !g_index[expr][frame])
+        return 450;
+    return g_index[expr][frame]->hold_ms ? g_index[expr][frame]->hold_ms : 450;
 }
 
 bool assets_has(int expr)
@@ -158,21 +177,19 @@ bool assets_has(int expr)
 int assets_expr_count(void)
 {
     int n = 0;
-    for (int expr = 0; expr < 8; ++expr)
+    for (int expr = 0; expr < EXPR_MAX; ++expr)
         n += assets_has(expr);
     return n;
 }
 
 const uint8_t *assets_frame(int expr, int frame)
 {
-    if (!g_ready || !g_map || expr < 0)
+    if (!g_ready || !g_map || expr < 0 || expr >= EXPR_MAX || frame < 0 || frame >= FRAME_MAX)
         return 0;
-    for (int i = 0; i < g_count; ++i) {
-        const AssetEntry *e = &g_entries[i];
-        if (e->expr == expr && e->frame == frame && e->size >= 32 && e->offset + e->size <= g_part->size)
-            return g_map + e->offset;
-    }
-    return 0;
+    const AssetEntry *e = g_index[expr][frame];
+    if (!e)
+        return 0;
+    return g_map + e->offset;
 }
 
 static size_t jpeg_read(JDEC *jd, uint8_t *buf, size_t len)
@@ -204,16 +221,15 @@ static int jpeg_write(JDEC *jd, void *bitmap, JRECT *rect)
 
 bool assets_blit(int expr, int frame, uint16_t *dest)
 {
-    const uint8_t *jpeg = assets_frame(expr, frame);
-    if (!jpeg || !dest)
+    if (!g_ready || !g_map || !dest || expr < 0 || expr >= EXPR_MAX || frame < 0 || frame >= FRAME_MAX)
         return false;
-    size_t size = 0;
-    for (int i = 0; i < g_count; ++i)
-        if (g_entries[i].expr == expr && g_entries[i].frame == frame && g_map + g_entries[i].offset == jpeg)
-            size = g_entries[i].size;
-    if (!size)
+    const AssetEntry *e = g_index[expr][frame];
+    if (!e)
         return false;
-    JpegClip clip = {.data = jpeg, .size = size, .pos = 0, .dest = dest};
+    const uint8_t *jpeg = g_map + e->offset;
+    if (esp_rom_crc32_le(0, jpeg, e->size) != e->crc)
+        return false;
+    JpegClip clip = {.data = jpeg, .size = e->size, .pos = 0, .dest = dest};
     JDEC jd;
     memset(&jd, 0, sizeof(jd));
     if (jd_prepare(&jd, jpeg_read, g_jpeg_pool, sizeof(g_jpeg_pool), &clip) != JDR_OK)

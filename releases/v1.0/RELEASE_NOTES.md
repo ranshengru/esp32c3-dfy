@@ -18,7 +18,7 @@
 
 用 ESP-IDF 5.4.2 编译。开机串口是 `PET READY v1.0`，表情包正常时还有 `assets ok v20261115 clips 8/8 frames 192`。
 
-应用 `companion-v1.0.bin` 写到 `0x10000`（1,441,600 字节，1.5MB 槽位还剩大约 128KB）。表情包写到 `0x190000`（824,889 字节，2MB 分区还剩大约 1.2MB）。NVS 仍在 `0x9000`。不要整片擦除。
+应用 `companion-v1.0.bin` 写到 `0x10000`（1,442,656 字节，1.5MB 槽位还剩大约 127KB）。表情包写到 `0x190000`（824,889 字节，2MB 分区还剩大约 1.2MB）。NVS 仍在 `0x9000`。不要整片擦除。表情时间按每帧自己的停留走，不再被 100ms 轮询抹平；整屏一次 DMA 送出，时钟 26.7MHz。表情包不用重刷。
 
 ```sh
 python -m esptool --chip esp32c3 -b 460800 --before default_reset --after hard_reset write-flash \
