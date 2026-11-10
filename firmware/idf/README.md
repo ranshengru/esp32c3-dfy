@@ -159,23 +159,19 @@ HC-SR04 每 60 ms 测一次。回波宽度由 GPIO 中断记录时间戳，不�
 
 ## 断电重启
 
-所有设置（Wi-Fi、密钥、地点和经纬度、模式、寿星名字和生日、自动生日、挥手阈值、提醒间隔、留言）、AI 调用计数和上次调用时间、句子池都在 NVS 里，上电直接恢复，不需要重新配置。开机打印 `PET READY v0.5` 和 `boot #N reset 原因; pool 状态`（开机次数也存在 NVS），`STATUS` 里也有。联网后立刻查余额、取天气。
+所有设置（Wi-Fi、密钥、地点和经纬度、模式、寿星名字和生日、自动生日、挥手阈值、提醒间隔、留言）、AI 调用计数和上次调用时间、句子池都在 NVS 里，上电直接恢复，不需要重新配置。开机打印 `PET READY v1.0` 和 `boot #N reset 原因; pool 状态`（开机次数也存在 NVS），`STATUS` 里也有。联网后立刻查余额、取天气。
 
-## 不要直接刷
+## 刷机
 
-`idf.py flash` 会重写引导程序和分区表，不只是 `0x10000` 上的应用。先备份整片 4MB：
+不要整片擦除，也不要只写应用就当升到了 v1.0。分区表变了，表情包在单独的分区。完整命令在本文开头，文件在 `releases/v1.0/`。`idf.py flash` 还会重写引导程序，平常升级不必用它。
+
+先备份整片 4MB：
 
 ```sh
 python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodem1101 read-flash 0x0 0x400000 original-flash.bin
 ```
 
-分区：nvs `0x9000`，phy `0xf000`，应用 `0x10000` 起、1.5MB（v0.5 应用约 1.35MB，其中两套字库约 0.3MB）。分区表和引导程序与 v0.4 相同时，只写应用即可：
-
-```sh
-python3 -m esptool --chip esp32c3 --port /dev/cu.usbmodem1101 write-flash --flash-mode dio --flash-size 4MB --flash-freq 40m 0x10000 releases/v0.5/companion-v0.5.bin
-```
-
-NVS 里的设置（Wi-Fi、密钥、城市、提醒间隔）从 v0.4 升级会保留。密钥只进 NVS，不会打进固件，也不会在日志里打印。
+分区：nvs `0x9000`，phy `0xf000`，应用 `0x10000` 起、1.5MB，表情包 `0x190000` 起、2MB。密钥只进 NVS，不会打进固件，也不会在日志里打印。已经刷过这份分区表、只改过程序的，可以只写 `0x10000`。
 
 ## 设置页
 
