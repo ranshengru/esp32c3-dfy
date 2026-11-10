@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Pack the eight expression loops into assets.bin.
+"""Pack the eight expression clips into assets.bin.
 
-Each frame is the full 128x160 screen, stored like idle.rgb565 (shifted down
-10px, rotated 180 degrees, big-endian RGB565) and left uncompressed. The
-firmware maps the pack through the flash cache, so a frame does not occupy
-RAM. 困 and 打盹 are separate loops.
+Each clip is a short MJPEG: four baseline JPEG frames of the 128x160 screen.
+The firmware plays a frame by decoding it into the framebuffer it already
+has. 困 and 打盹 are separate clips.
 """
 
+import io
 import struct
 import subprocess
 import zlib
@@ -21,7 +21,7 @@ PREVIEW = ROOT / "docs" / "v1.0-expressions-preview.png"
 WIDTH, HEIGHT = 128, 160
 SHIFT = 10
 RAW = WIDTH * HEIGHT * 2
-PACK_VERSION = 20261111
+PACK_VERSION = 20261112
 VIDEO_DIR = Path("/workspace/artifacts/imagine_videos")
 GRAB_DIR = Path("/tmp/expr-frames")
 
@@ -101,11 +101,14 @@ def grab(video, second, dest):
 
 
 def frame_bytes(canvas):
-    rotated = canvas.transpose(Image.Transpose.ROTATE_180)
-    raw = b"".join(rgb565(px).to_bytes(2, "big") for px in rotated.getdata())
-    if len(raw) != RAW:
-        raise SystemExit(f"frame is {len(raw)} bytes, expected {RAW}")
-    return raw
+    if canvas.size != (WIDTH, HEIGHT):
+        raise SystemExit(f"frame is {canvas.size}, expected {(WIDTH, HEIGHT)}")
+    buf = io.BytesIO()
+    canvas.convert("RGB").save(buf, "JPEG", quality=90, optimize=True, subsampling=2, progressive=False)
+    data = buf.getvalue()
+    if not data.startswith(b"\xff\xd8") or len(data) > 20 * 1024:
+        raise SystemExit(f"bad jpeg ({len(data)} bytes)")
+    return data
 
 
 def crc32(data):
@@ -132,7 +135,7 @@ def main():
             entries.append((expr_id, frame_i, raw))
             if frame_i == 0:
                 previews.append((label, canvas))
-            print(f"{key} frame {frame_i}: {len(raw)} bytes in flash")
+            print(f"{key} frame {frame_i}: jpeg {len(raw)} bytes")
 
     directory = bytearray()
     payload = bytearray()
@@ -146,12 +149,12 @@ def main():
     head = struct.pack(
         "<4sHHIHHBBHII",
         b"DFYA",
-        3,
+        4,
         header_size,
         PACK_VERSION,
         WIDTH,
         HEIGHT,
-        1,
+        2,
         0,
         len(entries),
         len(data),

@@ -1,4 +1,5 @@
 #include "assets.h"
+#include "tjpgd.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -7,7 +8,7 @@
 #include "esp_partition.h"
 #include "esp_rom_crc.h"
 
-enum { WIDTH = 128, HEIGHT = 160, RAW = WIDTH * HEIGHT * 2, ENTRY_MAX = 64, FORMAT_RAW = 3 };
+enum { WIDTH = 128, HEIGHT = 160, ENTRY_MAX = 64, FORMAT_VIDEO = 4, JPEG_MAX = 20 * 1024 };
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -45,12 +46,20 @@ static char g_line[96] = "assets missing";
 static const uint8_t *g_map;
 static esp_partition_mmap_handle_t g_map_handle;
 static bool g_ready;
+static uint8_t g_jpeg_pool[4096];
+
+typedef struct {
+    const uint8_t *data;
+    size_t size;
+    size_t pos;
+    uint16_t *dest;
+} JpegClip;
 
 static bool header_sane(const AssetHeader *h, const uint8_t *bytes)
 {
-    if (memcmp(h->magic, "DFYA", 4) || h->format != FORMAT_RAW || h->header_size != sizeof(AssetHeader))
+    if (memcmp(h->magic, "DFYA", 4) || h->format != FORMAT_VIDEO || h->header_size != sizeof(AssetHeader))
         return false;
-    if (h->width != WIDTH || h->height != HEIGHT || h->pixel_format != 1)
+    if (h->width != WIDTH || h->height != HEIGHT || h->pixel_format != 2)
         return false;
     if (!h->entry_count || h->entry_count > ENTRY_MAX)
         return false;
@@ -80,8 +89,8 @@ void assets_init(void)
         return;
     }
     memcpy(&header, raw, sizeof(header));
-    if (!memcmp(header.magic, "DFYA", 4) && header.format == 2) {
-        set_line("assets old zlib pack");
+    if (!memcmp(header.magic, "DFYA", 4) && (header.format == 2 || header.format == 3)) {
+        set_line(header.format == 2 ? "assets old zlib pack" : "assets old raw frames");
         ESP_LOGW(TAG, "%s", g_line);
         return;
     }
@@ -110,7 +119,7 @@ void assets_init(void)
     int bad = 0;
     for (unsigned i = 0; i < header.entry_count; ++i) {
         const AssetEntry *e = &g_entries[i];
-        if (e->expr >= 8 || e->size != RAW || e->offset + e->size > g_part->size)
+        if (e->expr >= 8 || e->size < 32 || e->size > JPEG_MAX || e->offset + e->size > g_part->size)
             ++bad;
     }
     g_count = (int)header.entry_count;
@@ -119,7 +128,7 @@ void assets_init(void)
     int faces = 0;
     for (int expr = 0; expr < 8; ++expr)
         faces += assets_has(expr);
-    snprintf(g_line, sizeof(g_line), "assets %s v%lu faces %d/8 frames %d flash", g_ready ? "ok" : "partial",
+    snprintf(g_line, sizeof(g_line), "assets %s v%lu clips %d/8 frames %d mjpeg", g_ready ? "ok" : "partial",
              (unsigned long)g_version, faces, g_count);
     ESP_LOGI(TAG, "%s", g_line);
 }
@@ -152,10 +161,58 @@ const uint8_t *assets_frame(int expr, int frame)
         return 0;
     for (int i = 0; i < g_count; ++i) {
         const AssetEntry *e = &g_entries[i];
-        if (e->expr == expr && e->frame == frame && e->size == RAW && e->offset + RAW <= g_part->size)
+        if (e->expr == expr && e->frame == frame && e->size >= 32 && e->offset + e->size <= g_part->size)
             return g_map + e->offset;
     }
     return 0;
+}
+
+static size_t jpeg_read(JDEC *jd, uint8_t *buf, size_t len)
+{
+    JpegClip *clip = jd->device;
+    if (clip->pos >= clip->size)
+        return 0;
+    if (len > clip->size - clip->pos)
+        len = clip->size - clip->pos;
+    if (buf)
+        memcpy(buf, clip->data + clip->pos, len);
+    clip->pos += len;
+    return len;
+}
+
+static int jpeg_write(JDEC *jd, void *bitmap, JRECT *rect)
+{
+    JpegClip *clip = jd->device;
+    if (rect->right >= WIDTH || rect->bottom >= HEIGHT)
+        return 0;
+    unsigned w = (unsigned)(rect->right - rect->left + 1);
+    const uint16_t *src = bitmap;
+    for (unsigned y = rect->top; y <= rect->bottom; ++y) {
+        memcpy(clip->dest + y * WIDTH + rect->left, src, w * sizeof(uint16_t));
+        src += w;
+    }
+    return 1;
+}
+
+bool assets_blit(int expr, int frame, uint16_t *dest)
+{
+    const uint8_t *jpeg = assets_frame(expr, frame);
+    if (!jpeg || !dest)
+        return false;
+    size_t size = 0;
+    for (int i = 0; i < g_count; ++i)
+        if (g_entries[i].expr == expr && g_entries[i].frame == frame && g_map + g_entries[i].offset == jpeg)
+            size = g_entries[i].size;
+    if (!size)
+        return false;
+    JpegClip clip = {.data = jpeg, .size = size, .pos = 0, .dest = dest};
+    JDEC jd;
+    memset(&jd, 0, sizeof(jd));
+    if (jd_prepare(&jd, jpeg_read, g_jpeg_pool, sizeof(g_jpeg_pool), &clip) != JDR_OK)
+        return false;
+    if (jd.width != WIDTH || jd.height != HEIGHT)
+        return false;
+    return jd_decomp(&jd, jpeg_write, 0) == JDR_OK;
 }
 
 const char *assets_status_line(void)
@@ -179,12 +236,12 @@ void assets_selftest(void)
     AssetHeader header;
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "DFYA", 4);
-    header.format = FORMAT_RAW;
+    header.format = FORMAT_VIDEO;
     header.header_size = 32;
     header.pack_version = 1;
     header.width = WIDTH;
     header.height = HEIGHT;
-    header.pixel_format = 1;
+    header.pixel_format = 2;
     header.entry_count = 1;
     header.data_size = 16;
     header.data_crc = 0;
@@ -205,7 +262,7 @@ void assets_selftest(void)
     header.format = 2;
     memcpy(bytes, &header, 32);
     ASSET_CHECK("zlib format", !header_sane(&header, bytes));
-    header.format = FORMAT_RAW;
+    header.format = 3;
     header.header_crc ^= 0x5a;
     memcpy(bytes, &header, 32);
     ASSET_CHECK("bad header crc", !header_sane(&header, bytes));

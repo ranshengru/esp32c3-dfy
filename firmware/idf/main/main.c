@@ -42,7 +42,7 @@ static int64_t g_face_us;
 static bool apply_face(const UiState *ui)
 {
     if (!ui->expr_on) {
-        display_set_portrait(0);
+        display_set_clip(-1, 0);
         g_face_expr = -1;
         return false;
     }
@@ -50,7 +50,7 @@ static bool apply_face(const UiState *ui)
     int64_t now = esp_timer_get_time();
     int before = g_face_frame;
     if (frames < 1) {
-        display_set_portrait(0);
+        display_set_clip(-1, 0);
         return false;
     }
     if ((int)ui->expr != g_face_expr) {
@@ -61,7 +61,7 @@ static bool apply_face(const UiState *ui)
         g_face_frame = (g_face_frame + 1) % frames;
         g_face_us = now;
     }
-    display_set_portrait(assets_frame(ui->expr, g_face_frame));
+    display_set_clip(ui->expr, g_face_frame);
     return g_face_frame != before;
 }
 

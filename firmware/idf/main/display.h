@@ -64,5 +64,7 @@ void display_anim_frame(const UiState *ui, int frame);
 // NULL keeps the built-in portrait. Otherwise a 128x160 big-endian RGB565
 // buffer already rotated 180 degrees, same layout as idle.rgb565.
 void display_set_portrait(const uint8_t *be_rgb565);
+// Play one frame of an expression clip. expr < 0 goes back to the built-in portrait.
+void display_set_clip(int expr, int frame);
 
 #endif

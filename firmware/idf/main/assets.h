@@ -4,14 +4,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// Loads the DFYA pack from the assets partition and maps it through the
-// flash cache. Frames are raw RGB565 in flash, not a RAM copy. A missing or
-// corrupt pack is not fatal: lookups fail and the screen keeps the built-in
-// portrait.
+// Maps the MJPEG expression clips from the assets partition. A missing or
+// old pack is not fatal: blit fails and the screen keeps the built-in portrait.
 void assets_init(void);
-// Big-endian RGB565 already rotated 180 like idle.rgb565, pointing into the
-// mapped assets partition. NULL if this frame is not in the pack.
+// JPEG bytes of one video frame inside the mapped partition, or NULL.
 const uint8_t *assets_frame(int expr, int frame);
+// Decode that frame into a 128x160 RGB565 buffer in visual order (the same
+// order as the framebuffer). Uses a few KB of workspace, not a second picture.
+bool assets_blit(int expr, int frame, uint16_t *dest);
 int assets_frames(int expr);
 bool assets_has(int expr);
 int assets_expr_count(void);

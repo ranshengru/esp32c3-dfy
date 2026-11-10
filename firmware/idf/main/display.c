@@ -1,7 +1,10 @@
 #include "display.h"
+#include "assets.h"
 #include "glyphs.h"
 
+#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -31,6 +34,8 @@ static uint16_t fb[WIDTH * HEIGHT];
 extern const uint8_t idle_rgb565_start[] asm("_binary_idle_rgb565_start");
 extern const uint8_t idle_rgb565_end[] asm("_binary_idle_rgb565_end");
 static const uint8_t *g_portrait;
+static int g_clip_expr = -1;
+static int g_clip_frame;
 
 static void spi_bytes(const uint8_t *data, int len)
 {
@@ -457,8 +462,50 @@ static const Pose bounce[] = {
     {104, 91}, {104, 90}, {102, 96}, {99, 104}, {100, 100},
 };
 
+static void paint_from_rgb(const uint16_t *src, const Pose *pose)
+{
+    int columns[WIDTH];
+    for (int vx = 0; vx < WIDTH; ++vx) {
+        int sx = pose->width == 100 ? vx : (vx - WIDTH / 2) * 100 / pose->width + WIDTH / 2;
+        columns[vx] = (sx >= 0 && sx < WIDTH) ? sx : -1;
+    }
+    for (int vy = 0; vy < HEIGHT; ++vy) {
+        int src_vy = pose->height == 100 ? vy : HEIGHT - 1 - (HEIGHT - 1 - vy) * 100 / pose->height;
+        uint16_t *out = &fb[vy * WIDTH];
+        if (src_vy < 0 || src_vy >= HEIGHT) {
+            for (int vx = 0; vx < WIDTH; ++vx)
+                out[vx] = WHITE;
+            continue;
+        }
+        const uint16_t *row = src + src_vy * WIDTH;
+        for (int vx = 0; vx < WIDTH; ++vx) {
+            int sx = columns[vx];
+            out[vx] = sx < 0 ? WHITE : row[sx];
+        }
+    }
+}
+
+static bool paint_clip(const Pose *pose)
+{
+    if (g_clip_expr < 0)
+        return false;
+    bool plain = pose->width == 100 && pose->height == 100;
+    if (plain)
+        return assets_blit(g_clip_expr, g_clip_frame, fb);
+    uint16_t *scratch = malloc((size_t)WIDTH * HEIGHT * sizeof(uint16_t));
+    if (!scratch)
+        return assets_blit(g_clip_expr, g_clip_frame, fb);
+    bool ok = assets_blit(g_clip_expr, g_clip_frame, scratch);
+    if (ok)
+        paint_from_rgb(scratch, pose);
+    free(scratch);
+    return ok;
+}
+
 static void paint_portrait(const Pose *pose)
 {
+    if (paint_clip(pose))
+        return;
     const uint8_t *src = g_portrait ? g_portrait : idle_rgb565_start;
     size_t expect = WIDTH * HEIGHT * 2;
     size_t have = g_portrait ? expect : (size_t)(idle_rgb565_end - idle_rgb565_start);
@@ -1127,6 +1174,15 @@ int display_anim_frames(void)
 void display_set_portrait(const uint8_t *be_rgb565)
 {
     g_portrait = be_rgb565;
+    if (!be_rgb565)
+        g_clip_expr = -1;
+}
+
+void display_set_clip(int expr, int frame)
+{
+    g_portrait = 0;
+    g_clip_expr = expr;
+    g_clip_frame = frame;
 }
 
 void display_anim_frame(const UiState *ui, int frame)
