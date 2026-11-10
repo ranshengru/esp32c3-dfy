@@ -61,8 +61,8 @@ void display_party_frame(const UiState *ui, int fx, int frame, uint32_t tick);
 // bubble stays still, as in v0.1).
 int display_anim_frames(void);
 void display_anim_frame(const UiState *ui, int frame);
-// NULL keeps the built-in portrait. Otherwise a 128x160 big-endian RGB565
-// buffer already rotated 180 degrees, same layout as idle.rgb565.
-void display_set_portrait(const uint8_t *be_rgb565);
+// expr < 0 (the default) draws the classic portrait from the pack or the
+// built-in fallback. Otherwise an expression frame decoded on the fly.
+void display_set_portrait(int expr, int frame);
 
 #endif

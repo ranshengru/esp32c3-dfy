@@ -1,4 +1,5 @@
 #include "display.h"
+#include "assets.h"
 #include "glyphs.h"
 
 #include <stdio.h>
@@ -28,9 +29,8 @@ static const char *TAG = "display";
 static spi_device_handle_t spi;
 static uint16_t fb[WIDTH * HEIGHT];
 
-extern const uint8_t idle_rgb565_start[] asm("_binary_idle_rgb565_start");
-extern const uint8_t idle_rgb565_end[] asm("_binary_idle_rgb565_end");
-static const uint8_t *g_portrait;
+static int g_src_expr = -1;
+static int g_src_frame;
 
 static void spi_bytes(const uint8_t *data, int len)
 {
@@ -459,15 +459,8 @@ static const Pose bounce[] = {
 
 static void paint_portrait(const Pose *pose)
 {
-    const uint8_t *src = g_portrait ? g_portrait : idle_rgb565_start;
-    size_t expect = WIDTH * HEIGHT * 2;
-    size_t have = g_portrait ? expect : (size_t)(idle_rgb565_end - idle_rgb565_start);
-    if (have < expect) {
-        for (int i = 0; i < WIDTH * HEIGHT; ++i)
-            fb[i] = WHITE;
-        return;
-    }
     int columns[WIDTH];
+    uint8_t row[WIDTH * 2];
     for (int vx = 0; vx < WIDTH; ++vx) {
         int src = pose->width == 100 ? vx : (vx - WIDTH / 2) * 100 / pose->width + WIDTH / 2;
         columns[vx] = (src >= 0 && src < WIDTH) ? src : -1;
@@ -481,14 +474,19 @@ static void paint_portrait(const Pose *pose)
             continue;
         }
         int memory_y = HEIGHT - 1 - src_vy;
+        if (!assets_src_row(g_src_expr, g_src_frame, memory_y, row)) {
+            for (int vx = 0; vx < WIDTH; ++vx)
+                out[vx] = WHITE;
+            continue;
+        }
         for (int vx = 0; vx < WIDTH; ++vx) {
             int sx = columns[vx];
             if (sx < 0) {
                 out[vx] = WHITE;
                 continue;
             }
-            unsigned at = (unsigned)(memory_y * WIDTH + (WIDTH - 1 - sx)) * 2;
-            out[vx] = ((uint16_t)src[at] << 8) | src[at + 1];
+            unsigned at = (unsigned)(WIDTH - 1 - sx) * 2;
+            out[vx] = ((uint16_t)row[at] << 8) | row[at + 1];
         }
     }
 }
@@ -1099,10 +1097,6 @@ void display_party_frame(const UiState *ui, int fx, int frame, uint32_t tick)
 void display_init(void)
 {
     panel_init();
-    size_t expect = WIDTH * HEIGHT * 2;
-    size_t have = (size_t)(idle_rgb565_end - idle_rgb565_start);
-    if (have != expect)
-        ESP_LOGE(TAG, "idle image is %u bytes, expected %u", (unsigned)have, (unsigned)expect);
     UiState blank = {0};
     display_show(&blank);
 }
@@ -1124,9 +1118,10 @@ int display_anim_frames(void)
     return (int)(sizeof(bounce) / sizeof(bounce[0]));
 }
 
-void display_set_portrait(const uint8_t *be_rgb565)
+void display_set_portrait(int expr, int frame)
 {
-    g_portrait = be_rgb565;
+    g_src_expr = expr;
+    g_src_frame = frame;
 }
 
 void display_anim_frame(const UiState *ui, int frame)
