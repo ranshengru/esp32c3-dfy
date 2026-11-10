@@ -2,8 +2,9 @@
 """Pack the eight expression loops into assets.bin.
 
 Each frame is the full 128x160 screen, stored like idle.rgb565 (shifted down
-10px, rotated 180 degrees, big-endian RGB565) and zlib-compressed. A frame is
-about 11 KB with no colour loss. 困 and 打盹 are separate loops.
+10px, rotated 180 degrees, big-endian RGB565) and left uncompressed. The
+firmware maps the pack through the flash cache, so a frame does not occupy
+RAM. 困 and 打盹 are separate loops.
 """
 
 import struct
@@ -20,7 +21,7 @@ PREVIEW = ROOT / "docs" / "v1.0-expressions-preview.png"
 WIDTH, HEIGHT = 128, 160
 SHIFT = 10
 RAW = WIDTH * HEIGHT * 2
-PACK_VERSION = 20261110
+PACK_VERSION = 20261111
 VIDEO_DIR = Path("/workspace/artifacts/imagine_videos")
 GRAB_DIR = Path("/tmp/expr-frames")
 
@@ -104,10 +105,7 @@ def frame_bytes(canvas):
     raw = b"".join(rgb565(px).to_bytes(2, "big") for px in rotated.getdata())
     if len(raw) != RAW:
         raise SystemExit(f"frame is {len(raw)} bytes, expected {RAW}")
-    comp = zlib.compress(raw, 9)
-    if zlib.decompress(comp) != raw:
-        raise SystemExit("zlib round-trip failed")
-    return comp
+    return raw
 
 
 def crc32(data):
@@ -120,17 +118,21 @@ def main():
     previews = []
     for expr_id, (key, label, frames) in enumerate(EXPRS):
         for frame_i, (video_name, second) in enumerate(frames):
-            full = GRAB_DIR / f"{key}_{frame_i}.png"
-            grab(VIDEO_DIR / video_name, second, full)
-            canvas = screen_canvas(Image.open(full))
-            canvas.save(OUT_DIR / f"{key}_{frame_i}.png")
-            comp = frame_bytes(canvas)
-            if len(comp) > 16 * 1024:
-                raise SystemExit(f"{key}_{frame_i} compressed to {len(comp)} (>16KB)")
-            entries.append((expr_id, frame_i, comp))
+            png = OUT_DIR / f"{key}_{frame_i}.png"
+            if png.exists():
+                canvas = Image.open(png).convert("RGB")
+                if canvas.size != (WIDTH, HEIGHT):
+                    canvas = screen_canvas(canvas)
+            else:
+                full = GRAB_DIR / f"{key}_{frame_i}.png"
+                grab(VIDEO_DIR / video_name, second, full)
+                canvas = screen_canvas(Image.open(full))
+                canvas.save(png)
+            raw = frame_bytes(canvas)
+            entries.append((expr_id, frame_i, raw))
             if frame_i == 0:
                 previews.append((label, canvas))
-            print(f"{key} frame {frame_i}: {len(comp)} bytes")
+            print(f"{key} frame {frame_i}: {len(raw)} bytes in flash")
 
     directory = bytearray()
     payload = bytearray()
@@ -144,7 +146,7 @@ def main():
     head = struct.pack(
         "<4sHHIHHBBHII",
         b"DFYA",
-        2,
+        3,
         header_size,
         PACK_VERSION,
         WIDTH,

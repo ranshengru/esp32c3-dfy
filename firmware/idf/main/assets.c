@@ -1,7 +1,5 @@
 #include "assets.h"
 
-#include "miniz.h"
-
 #include <stdio.h>
 #include <string.h>
 
@@ -9,7 +7,7 @@
 #include "esp_partition.h"
 #include "esp_rom_crc.h"
 
-enum { WIDTH = 128, HEIGHT = 160, RAW = WIDTH * HEIGHT * 2, COMP_MAX = 16 * 1024, ENTRY_MAX = 64 };
+enum { WIDTH = 128, HEIGHT = 160, RAW = WIDTH * HEIGHT * 2, ENTRY_MAX = 64, FORMAT_RAW = 3 };
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -44,16 +42,13 @@ static AssetEntry g_entries[ENTRY_MAX];
 static int g_count;
 static uint32_t g_version;
 static char g_line[96] = "assets missing";
-static uint8_t g_raw[RAW];
-static uint8_t g_comp[COMP_MAX];
-static tinfl_decompressor g_infl;
-static int g_cache_expr = -1;
-static int g_cache_frame = -1;
+static const uint8_t *g_map;
+static esp_partition_mmap_handle_t g_map_handle;
 static bool g_ready;
 
 static bool header_sane(const AssetHeader *h, const uint8_t *bytes)
 {
-    if (memcmp(h->magic, "DFYA", 4) || h->format != 2 || h->header_size != sizeof(AssetHeader))
+    if (memcmp(h->magic, "DFYA", 4) || h->format != FORMAT_RAW || h->header_size != sizeof(AssetHeader))
         return false;
     if (h->width != WIDTH || h->height != HEIGHT || h->pixel_format != 1)
         return false;
@@ -67,29 +62,11 @@ static void set_line(const char *text)
     snprintf(g_line, sizeof(g_line), "%s", text);
 }
 
-static size_t inflate_zlib(const uint8_t *src, size_t src_len)
-{
-    tinfl_init(&g_infl);
-    size_t in_ofs = 0, out_ofs = 0;
-    const mz_uint32 flags = TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-    for (;;) {
-        size_t in_size = src_len - in_ofs;
-        size_t out_size = RAW - out_ofs;
-        tinfl_status st = tinfl_decompress(&g_infl, src + in_ofs, &in_size, g_raw, g_raw + out_ofs, &out_size, flags);
-        in_ofs += in_size;
-        out_ofs += out_size;
-        if (st == TINFL_STATUS_DONE)
-            return out_ofs;
-        if (st != TINFL_STATUS_HAS_MORE_OUTPUT || out_ofs >= RAW)
-            return 0;
-    }
-}
-
 void assets_init(void)
 {
     g_ready = false;
     g_count = 0;
-    g_cache_expr = -1;
+    g_map = 0;
     g_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "assets");
     if (!g_part) {
         set_line("assets missing");
@@ -103,39 +80,37 @@ void assets_init(void)
         return;
     }
     memcpy(&header, raw, sizeof(header));
+    if (!memcmp(header.magic, "DFYA", 4) && header.format == 2) {
+        set_line("assets old zlib pack");
+        ESP_LOGW(TAG, "%s", g_line);
+        return;
+    }
     if (!header_sane(&header, raw)) {
         set_line("assets bad header");
         ESP_LOGW(TAG, "%s", g_line);
         return;
     }
-    if (esp_partition_read(g_part, header.header_size, g_entries, header.entry_count * sizeof(AssetEntry)) != ESP_OK) {
-        set_line("assets bad directory");
+    // Whole partition is 64KB-aligned, so the flash cache can map it. Pixels
+    // stay in flash; nothing is copied into RAM.
+    const void *mapped = 0;
+    if (esp_partition_mmap(g_part, 0, g_part->size, ESP_PARTITION_MMAP_DATA, &mapped, &g_map_handle) != ESP_OK ||
+        !mapped) {
+        set_line("assets map failed");
+        ESP_LOGW(TAG, "%s", g_line);
         return;
     }
-    uint32_t crc = 0;
-    size_t left = header.data_size;
-    size_t at = header.header_size;
-    uint8_t chunk[1024];
-    bool read_ok = left <= g_part->size - header.header_size;
-    while (read_ok && left) {
-        size_t n = left > sizeof(chunk) ? sizeof(chunk) : left;
-        if (esp_partition_read(g_part, at, chunk, n) != ESP_OK) {
-            read_ok = false;
-            break;
-        }
-        crc = esp_rom_crc32_le(crc, chunk, n);
-        at += n;
-        left -= n;
-    }
-    if (!read_ok || crc != header.data_crc) {
+    g_map = mapped;
+    if (header.data_size > g_part->size - header.header_size ||
+        esp_rom_crc32_le(0, g_map + header.header_size, header.data_size) != header.data_crc) {
         set_line("assets bad crc");
         ESP_LOGW(TAG, "%s", g_line);
         return;
     }
+    memcpy(g_entries, g_map + header.header_size, header.entry_count * sizeof(AssetEntry));
     int bad = 0;
     for (unsigned i = 0; i < header.entry_count; ++i) {
         const AssetEntry *e = &g_entries[i];
-        if (e->expr >= 8 || e->size == 0 || e->size > COMP_MAX || e->offset + e->size > g_part->size)
+        if (e->expr >= 8 || e->size != RAW || e->offset + e->size > g_part->size)
             ++bad;
     }
     g_count = (int)header.entry_count;
@@ -144,8 +119,8 @@ void assets_init(void)
     int faces = 0;
     for (int expr = 0; expr < 8; ++expr)
         faces += assets_has(expr);
-    snprintf(g_line, sizeof(g_line), "assets %s v%lu faces %d/8 frames %d bad %d", g_ready ? "ok" : "partial",
-             (unsigned long)g_version, faces, g_count, bad);
+    snprintf(g_line, sizeof(g_line), "assets %s v%lu faces %d/8 frames %d flash", g_ready ? "ok" : "partial",
+             (unsigned long)g_version, faces, g_count);
     ESP_LOGI(TAG, "%s", g_line);
 }
 
@@ -173,25 +148,14 @@ int assets_expr_count(void)
 
 const uint8_t *assets_frame(int expr, int frame)
 {
-    if (!g_ready || expr < 0)
+    if (!g_ready || !g_map || expr < 0)
         return 0;
-    if (expr == g_cache_expr && frame == g_cache_frame)
-        return g_raw;
-    const AssetEntry *found = 0;
-    for (int i = 0; i < g_count; ++i)
-        if (g_entries[i].expr == expr && g_entries[i].frame == frame)
-            found = &g_entries[i];
-    if (!found || found->size > COMP_MAX)
-        return 0;
-    if (esp_partition_read(g_part, found->offset, g_comp, found->size) != ESP_OK)
-        return 0;
-    if (esp_rom_crc32_le(0, g_comp, found->size) != found->crc)
-        return 0;
-    if (inflate_zlib(g_comp, found->size) != RAW)
-        return 0;
-    g_cache_expr = expr;
-    g_cache_frame = frame;
-    return g_raw;
+    for (int i = 0; i < g_count; ++i) {
+        const AssetEntry *e = &g_entries[i];
+        if (e->expr == expr && e->frame == frame && e->size == RAW && e->offset + RAW <= g_part->size)
+            return g_map + e->offset;
+    }
+    return 0;
 }
 
 const char *assets_status_line(void)
@@ -215,7 +179,7 @@ void assets_selftest(void)
     AssetHeader header;
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, "DFYA", 4);
-    header.format = 2;
+    header.format = FORMAT_RAW;
     header.header_size = 32;
     header.pack_version = 1;
     header.width = WIDTH;
@@ -238,10 +202,10 @@ void assets_selftest(void)
     bytes[0] ^= 0x01;
     ASSET_CHECK("flipped magic", !header_sane(&header, bytes));
     bytes[0] ^= 0x01;
-    header.format = 1;
-    memcpy(bytes, &header, 32);
-    ASSET_CHECK("old format", !header_sane(&header, bytes));
     header.format = 2;
+    memcpy(bytes, &header, 32);
+    ASSET_CHECK("zlib format", !header_sane(&header, bytes));
+    header.format = FORMAT_RAW;
     header.header_crc ^= 0x5a;
     memcpy(bytes, &header, 32);
     ASSET_CHECK("bad header crc", !header_sane(&header, bytes));

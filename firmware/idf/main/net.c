@@ -1133,6 +1133,8 @@ static void check_reminders(void)
     xSemaphoreGive(mu);
 }
 
+static void remember_balance(void);
+
 static void fetch_balance(const char *key)
 {
     if (!key[0]) {
@@ -1147,6 +1149,7 @@ static void fetch_balance(const char *key)
     xSemaphoreGive(mu);
 
     int status = https_call(BALANCE_URL, key, 0);
+    bool store_bal = false;
     xSemaphoreTake(mu, portMAX_DELAY);
     if (status < 0) {
         detail("查询失败");
@@ -1197,6 +1200,7 @@ static void fetch_balance(const char *key)
                 snprintf(g_bal_hhmm, sizeof(g_bal_hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
             }
             detail(g_available ? "" : "不可用");
+            store_bal = g_total[0] != 0;
             if (g_balance_bubble) {
                 snprintf(g_phrase, sizeof(g_phrase), "%s", PHRASE_BALANCE);
                 g_phrase_until_us = esp_timer_get_time() + 7 * 1000000LL;
@@ -1213,6 +1217,8 @@ static void fetch_balance(const char *key)
     }
     g_balance_bubble = false;
     xSemaphoreGive(mu);
+    if (store_bal)
+        remember_balance();
 }
 
 static bool url_encode(char *out, size_t out_len, const char *in)
@@ -1294,6 +1300,32 @@ static void set_weather(const char *text)
     xSemaphoreGive(mu);
 }
 
+static void remember_weather(const char *line, int wcode, int temp_c)
+{
+    nvs_put("wline", line);
+    save_int("wcode", wcode);
+    save_int("wtemp", temp_c);
+}
+
+static void weather_failed(void)
+{
+    bool have = false;
+    xSemaphoreTake(mu, portMAX_DELAY);
+    have = strchr(g_weather, 'C') != 0;
+    xSemaphoreGive(mu);
+    if (have)
+        ESP_LOGW(TAG, "weather fetch failed, keeping stored line");
+    else
+        set_weather("天气失败");
+}
+
+static void remember_balance(void)
+{
+    nvs_put("bal", g_total);
+    nvs_put("cur", g_currency[0] ? g_currency : "CNY");
+    save_int("balok", g_available ? 1 : 0);
+}
+
 static void fetch_weather(void)
 {
     char city[32];
@@ -1320,7 +1352,7 @@ static void fetch_weather(void)
             snprintf(url, sizeof(url),
                      "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=zh&format=json",
                      encoded) >= (int)sizeof(url)) {
-            set_weather("天气失败");
+            weather_failed();
         } else {
             int status = https_call(url, 0, 0);
             cJSON *root = status == 200 ? cJSON_ParseWithLength(body, (size_t)body_len) : 0;
@@ -1329,7 +1361,7 @@ static void fetch_weather(void)
             cJSON *lat = first ? cJSON_GetObjectItem(first, "latitude") : 0;
             cJSON *lon = first ? cJSON_GetObjectItem(first, "longitude") : 0;
             if (!cJSON_IsNumber(lat) || !cJSON_IsNumber(lon)) {
-                set_weather("天气失败");
+                weather_failed();
             } else {
                 lat_e6 = (int)(lat->valuedouble * 1000000.0);
                 lon_e6 = (int)(lon->valuedouble * 1000000.0);
@@ -1365,7 +1397,7 @@ static void fetch_weather(void)
         cJSON *temp = current ? cJSON_GetObjectItem(current, "temperature_2m") : 0;
         cJSON *code = current ? cJSON_GetObjectItem(current, "weather_code") : 0;
         if (!cJSON_IsNumber(temp) || !cJSON_IsNumber(code)) {
-            set_weather("天气失败");
+            weather_failed();
         } else {
             double value = temp->valuedouble;
             int rounded = (int)(value + (value >= 0 ? 0.5 : -0.5));
@@ -1377,6 +1409,7 @@ static void fetch_weather(void)
             g_wcode = wcode;
             g_temp_c = rounded;
             xSemaphoreGive(mu);
+            remember_weather(line, wcode, rounded);
             xSemaphoreTake(mu, portMAX_DELAY);
             g_wx_today[0] = 0;
             g_wx_tomorrow[0] = 0;
@@ -2110,6 +2143,21 @@ void net_init(void)
         }
     }
     g_geo_fixed = g_has_geo && load_int("geofix", 0, 0, 1) == 1;
+    nvs_load("wline", g_weather, sizeof(g_weather));
+    if (strchr(g_weather, 'C')) {
+        g_wcode = load_int("wcode", -1, 0, 99);
+        g_temp_c = load_int("wtemp", 0, -40, 60);
+    } else {
+        g_weather[0] = 0;
+        g_wcode = -1;
+    }
+    nvs_load("bal", g_total, sizeof(g_total));
+    nvs_load("cur", g_currency, sizeof(g_currency));
+    if (g_total[0]) {
+        g_available = load_int("balok", 1, 0, 1) == 1;
+        if (!g_currency[0])
+            snprintf(g_currency, sizeof(g_currency), "CNY");
+    }
     g_mode = load_int("mode", 0, 0, 1);
     g_expr = load_int("expr", 0, 0, 1);
     nvs_load("bname", g_bname, sizeof(g_bname));
