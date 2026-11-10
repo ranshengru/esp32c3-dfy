@@ -2172,7 +2172,7 @@ void net_init(void)
     }
     portal_start();
     xTaskCreate(net_task, "net", 20480, 0, 5, &net_task_handle);
-    printf("PET READY v1.0\n");
+    printf("PET READY v1.0.1\n");
     printf("boot #%d reset %s; pool %s\n", g_boots, g_reset_name, g_pool_boot);
     printf("Settings: http://pet.local/ or http://<device-ip>/ on the home network; USB serial also works.\n");
     printf("SSID PASS KEY CITY LOC DRINK MOVE QUIET TZ MODE EXPR BNAME BDAY BAUTO MSG PAUSE SWEEP SONAR PET POOL BDAYDEMO AP FETCH STATUS SCAN FORGET WEBTEST\n");

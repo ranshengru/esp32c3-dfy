@@ -42,7 +42,7 @@ static int64_t g_face_us;
 static bool apply_face(const UiState *ui)
 {
     if (!ui->expr_on) {
-        display_set_portrait(0);
+        display_set_portrait(-1, 0);
         g_face_expr = -1;
         return false;
     }
@@ -50,18 +50,18 @@ static bool apply_face(const UiState *ui)
     int64_t now = esp_timer_get_time();
     int before = g_face_frame;
     if (frames < 1) {
-        display_set_portrait(0);
+        display_set_portrait(-1, 0);
         return false;
     }
     if ((int)ui->expr != g_face_expr) {
         g_face_expr = ui->expr;
         g_face_frame = 0;
         g_face_us = now;
-    } else if (frames > 1 && now - g_face_us >= 450000) {
+    } else if (frames > 1 && now - g_face_us >= 900000) {
         g_face_frame = (g_face_frame + 1) % frames;
         g_face_us = now;
     }
-    display_set_portrait(assets_frame(ui->expr, g_face_frame));
+    display_set_portrait(ui->expr, g_face_frame);
     return g_face_frame != before;
 }
 
@@ -159,8 +159,8 @@ static void ui_task(void *arg)
 void app_main(void)
 {
     setvbuf(stdin, NULL, _IONBF, 0);
-    display_init();
     assets_init();
+    display_init();
     net_init();
     xTaskCreate(ui_task, "ui", 6144, 0, 4, 0);
     sonar_start();

@@ -155,7 +155,7 @@ static void build_page(const NetSnapshot *snap)
            "border-radius:14px;padding:14px;font-size:16px;font-weight:600;font-family:inherit;color:#fff;background:var(--navy);box-shadow:0 8px 20px rgba(31,42,107,.3)}</style>");
 
     // Status header.
-    append("<main><section class=\"hero\"><h1>桌宠<span class=\"v\">v1.0</span></h1>");
+    append("<main><section class=\"hero\"><h1>桌宠<span class=\"v\">v1.0.1</span></h1>");
     append("<div class=\"big\"><b>%s</b><span>%s%s%s</span></div>", snap->time_ok ? snap->clock : "--:--",
            weather[0] ? weather : "天气未加载", city[0] ? " · " : "", city);
     append("<div class=\"chips\"><span class=\"chip %s\">%s %s</span><span class=\"chip\">%s</span><span class=\"chip\">%s</span>%s</div></section>",
@@ -246,7 +246,7 @@ static esp_err_t status_get(httpd_req_t *req)
     net_snapshot(&snap);
     char out[640];
     snprintf(out, sizeof(out),
-             "{\"version\":\"v1.0\",\"connected\":%s,\"ip\":\"%s\",\"mode\":%d,\"expr\":%d,\"birthday_now\":%s,"
+             "{\"version\":\"v1.0.1\",\"connected\":%s,\"ip\":\"%s\",\"mode\":%d,\"expr\":%d,\"birthday_now\":%s,"
              "\"days_to_birthday\":%d,\"weather_ok\":%s,\"llm_today\":%d,\"llm_cap\":%d,"
              "\"ap\":%s,\"heap\":%u,\"heap_min\":%u,\"uptime\":%u}",
              snap.connected ? "true" : "false", snap.ip, snap.mode, snap.expr_on, snap.birthday_now ? "true" : "false",
