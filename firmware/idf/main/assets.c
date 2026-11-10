@@ -1,4 +1,5 @@
 #include "assets.h"
+#include "mood.h"
 #include "tjpgd.h"
 
 #include <stdio.h>
@@ -8,8 +9,7 @@
 #include "esp_partition.h"
 #include "esp_rom_crc.h"
 
-enum { WIDTH = 128, HEIGHT = 160, EXPR_MAX = 8, FRAME_MAX = 24, ENTRY_MAX = 256, FORMAT_VIDEO = 4,
-      JPEG_MAX = 20 * 1024 };
+enum { WIDTH = 128, HEIGHT = 160, FRAME_MAX = 24, ENTRY_MAX = 256, FORMAT_VIDEO = 4, JPEG_MAX = 20 * 1024 };
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -48,8 +48,8 @@ static const uint8_t *g_map;
 static esp_partition_mmap_handle_t g_map_handle;
 static bool g_ready;
 static uint8_t g_jpeg_pool[4096];
-static const AssetEntry *g_index[EXPR_MAX][FRAME_MAX];
-static uint8_t g_nframes[EXPR_MAX];
+static const AssetEntry *g_index[EXPR_COUNT][FRAME_MAX];
+static uint8_t g_nframes[EXPR_COUNT];
 
 typedef struct {
     const uint8_t *data;
@@ -127,7 +127,7 @@ void assets_init(void)
     int bad = 0;
     for (unsigned i = 0; i < header.entry_count; ++i) {
         const AssetEntry *e = &g_entries[i];
-        if (e->expr >= EXPR_MAX || e->frame >= FRAME_MAX || e->size < 32 || e->size > JPEG_MAX ||
+        if (e->expr >= EXPR_COUNT || e->frame >= FRAME_MAX || e->size < 32 || e->size > JPEG_MAX ||
             e->offset < header.header_size || e->offset > need || e->size > need - e->offset ||
             g_index[e->expr][e->frame]) {
             ++bad;
@@ -135,7 +135,7 @@ void assets_init(void)
         }
         g_index[e->expr][e->frame] = e;
     }
-    for (int expr = 0; expr < EXPR_MAX; ++expr) {
+    for (int expr = 0; expr < EXPR_COUNT; ++expr) {
         int n = 0;
         while (n < FRAME_MAX && g_index[expr][n])
             ++n;
@@ -148,23 +148,23 @@ void assets_init(void)
     g_version = header.pack_version;
     g_ready = bad == 0;
     int faces = 0;
-    for (int expr = 0; expr < EXPR_MAX; ++expr)
+    for (int expr = 0; expr < EXPR_COUNT; ++expr)
         faces += g_nframes[expr] > 0;
-    snprintf(g_line, sizeof(g_line), "assets %s v%lu clips %d/8 frames %d mjpeg", g_ready ? "ok" : "partial",
-             (unsigned long)g_version, faces, g_count);
+    snprintf(g_line, sizeof(g_line), "assets %s v%lu clips %d/%d frames %d mjpeg", g_ready ? "ok" : "partial",
+             (unsigned long)g_version, faces, EXPR_COUNT, g_count);
     ESP_LOGI(TAG, "%s", g_line);
 }
 
 int assets_frames(int expr)
 {
-    if (expr < 0 || expr >= EXPR_MAX)
+    if (expr < 0 || expr >= EXPR_COUNT)
         return 0;
     return g_nframes[expr];
 }
 
 int assets_hold_ms(int expr, int frame)
 {
-    if (expr < 0 || expr >= EXPR_MAX || frame < 0 || frame >= FRAME_MAX || !g_index[expr][frame])
+    if (expr < 0 || expr >= EXPR_COUNT || frame < 0 || frame >= FRAME_MAX || !g_index[expr][frame])
         return 450;
     return g_index[expr][frame]->hold_ms ? g_index[expr][frame]->hold_ms : 450;
 }
@@ -177,14 +177,14 @@ bool assets_has(int expr)
 int assets_expr_count(void)
 {
     int n = 0;
-    for (int expr = 0; expr < EXPR_MAX; ++expr)
+    for (int expr = 0; expr < EXPR_COUNT; ++expr)
         n += assets_has(expr);
     return n;
 }
 
 const uint8_t *assets_frame(int expr, int frame)
 {
-    if (!g_ready || !g_map || expr < 0 || expr >= EXPR_MAX || frame < 0 || frame >= FRAME_MAX)
+    if (!g_ready || !g_map || expr < 0 || expr >= EXPR_COUNT || frame < 0 || frame >= FRAME_MAX)
         return 0;
     const AssetEntry *e = g_index[expr][frame];
     if (!e)
@@ -221,7 +221,7 @@ static int jpeg_write(JDEC *jd, void *bitmap, JRECT *rect)
 
 bool assets_blit(int expr, int frame, uint16_t *dest)
 {
-    if (!g_ready || !g_map || !dest || expr < 0 || expr >= EXPR_MAX || frame < 0 || frame >= FRAME_MAX)
+    if (!g_ready || !g_map || !dest || expr < 0 || expr >= EXPR_COUNT || frame < 0 || frame >= FRAME_MAX)
         return false;
     const AssetEntry *e = g_index[expr][frame];
     if (!e)

@@ -3,7 +3,7 @@
 #include <string.h>
 
 static const char *const MOOD_NAMES[EXPR_COUNT] = {
-    "neutral", "happy", "sleepy", "sleeping", "tsundere", "surprised", "worried", "excited",
+    "neutral", "happy", "sleepy", "sleeping", "tsundere", "surprised", "worried", "excited", "rice",
 };
 
 const char *mood_name(int expr)
@@ -33,10 +33,11 @@ int mood_from_text(const char *text)
         return EXPR_SLEEPY;
     if (strstr(text, "哼") || strstr(text, "才没有") || strstr(text, "才不"))
         return EXPR_TSUNDERE;
+    if (strstr(text, "饭") || strstr(text, "饿") || strstr(text, "吃"))
+        return EXPR_RICE;
     if (strstr(text, "哇") || strstr(text, "诶"))
         return EXPR_SURPRISED;
-    if (strstr(text, "开心") || strstr(text, "好耶") || strstr(text, "快乐") || strstr(text, "＞ω＜") ||
-        strstr(text, "饭") || strstr(text, "饿") || strstr(text, "吃"))
+    if (strstr(text, "开心") || strstr(text, "好耶") || strstr(text, "快乐") || strstr(text, "＞ω＜"))
         return EXPR_HAPPY;
     if (strstr(text, "伞") || strstr(text, "冷") || strstr(text, "小心") || strstr(text, "别"))
         return EXPR_WORRIED;

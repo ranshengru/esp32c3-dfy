@@ -22,7 +22,7 @@ PREVIEW = ROOT / "docs" / "v1.0-expressions-preview.png"
 SHEET = ROOT / "docs" / "v1.0-24frames.png"
 WIDTH, HEIGHT = 128, 160
 SHIFT = 10
-PACK_VERSION = 20261115
+PACK_VERSION = 20261116
 VIDEO_DIR = ROOT / "assets" / "expressions" / "videos"
 FRAME_COUNT = 24
 SRC_FPS = 24
@@ -37,6 +37,7 @@ EXPRS = [
     ("surprised", "惊讶", "surprised.mp4"),
     ("worried", "担心", "worried.mp4"),
     ("excited", "兴奋", "excited.mp4"),
+    ("rice", "吃饭", "rice.mp4"),
 ]
 
 
@@ -171,30 +172,25 @@ def grab_frames(video, indices, dest_dir):
     return frames
 
 
-def encode_jpegs(canvases, dest_dir):
-    """One ffmpeg for the whole clip. -q:v 5 stays; q:v 8 blocks the eyes."""
-    if dest_dir.exists():
-        subprocess.check_call(["rm", "-rf", str(dest_dir)])
-    dest_dir.mkdir(parents=True)
-    for i, canvas in enumerate(canvases):
-        canvas.save(dest_dir / f"f_{i:02d}.png")
+def encode_jpeg(canvas, dest):
+    """Same encoder as the other clips: one baseline 4:2:0 JPEG, ffmpeg -q:v 5."""
+    png = dest.with_suffix(".png")
+    canvas.save(png)
     subprocess.check_call(
         [
-            "ffmpeg", "-y", "-start_number", "0", "-i", str(dest_dir / "f_%02d.png"),
+            "ffmpeg", "-y", "-i", str(png),
             "-c:v", "mjpeg", "-q:v", str(QV), "-pix_fmt", "yuvj420p",
-            str(dest_dir / "o_%02d.jpg"),
+            "-frames:v", "1", str(dest),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    out = []
-    for i in range(len(canvases)):
-        data = (dest_dir / f"o_{i:02d}.jpg").read_bytes()
-        if not data.startswith(b"\xff\xd8") or not is_baseline(data) or len(data) > 20 * 1024:
-            raise SystemExit(f"bad jpeg frame {i} ({len(data)} bytes)")
-        out.append(data)
-    subprocess.check_call(["rm", "-rf", str(dest_dir)])
-    return out
+    png.unlink()
+    data = dest.read_bytes()
+    dest.unlink()
+    if not data.startswith(b"\xff\xd8") or not is_baseline(data) or len(data) > 20 * 1024:
+        raise SystemExit(f"bad jpeg ({len(data)} bytes)")
+    return data
 
 
 def main():
@@ -220,8 +216,6 @@ def main():
             cropped, frame_h = tight_crop(canvas)
             canvases.append((canvas, cropped))
             heights.append(frame_h)
-        jpegs = encode_jpegs([cropped for _, cropped in canvases], Path(f"/tmp/enc-{key}"))
-        subprocess.check_call(["rm", "-rf", f"/tmp/grab-{key}"])
         row = []
         for frame_i, (index, t) in enumerate(zip(indices, times)):
             if frame_i + 1 < len(times):
@@ -231,13 +225,14 @@ def main():
             else:
                 nxt = t + 1 / SRC_FPS
             hold_ms = max(40, int(round((nxt - t) * 1000)))
-            canvas, _cropped = canvases[frame_i]
-            jpeg = jpegs[frame_i]
+            canvas, cropped = canvases[frame_i]
+            jpeg = encode_jpeg(cropped, Path(f"/tmp/enc-{key}-{frame_i}.jpg"))
             entries.append((expr_id, frame_i, hold_ms, jpeg))
             if frame_i == 0:
                 previews.append((label, canvas))
             row.append(canvas)
             print(f"  [{frame_i:02d}] src {index} hold {hold_ms}ms h {heights[frame_i]} jpeg {len(jpeg)}")
+        subprocess.check_call(["rm", "-rf", f"/tmp/grab-{key}"])
         strips.append((label, row))
 
     directory = bytearray()
@@ -270,13 +265,14 @@ def main():
     print(f"wrote {BIN_PATH} {len(blob)} bytes, {len(entries)} frames")
 
     scale = 2
-    cols = 4
+    cols = 5
+    rows = (len(previews) + cols - 1) // cols
     pad = 12
     label_h = 26
     cell_w, cell_h = WIDTH * scale, HEIGHT * scale
     sheet = Image.new(
         "RGB",
-        (cols * cell_w + (cols + 1) * pad, 2 * (cell_h + label_h) + 3 * pad),
+        (cols * cell_w + (cols + 1) * pad, rows * (cell_h + label_h) + (rows + 1) * pad),
         (243, 234, 220),
     )
     draw = ImageDraw.Draw(sheet)

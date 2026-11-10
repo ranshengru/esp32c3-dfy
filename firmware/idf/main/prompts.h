@@ -33,8 +33,8 @@ static const char PET_SYSTEM_PROMPT[] =
     "和 {weather}（显示时换成像“小雨”“多云”这样的天气），不要自己写具体度数；\n"
     "6. 只按要求输出 JSON，不输出任何解释。\n"
     "7. 每句再标一个心情，只能从这些里选：neutral 平常，happy 开心，sleepy 困，sleeping 打盹，"
-    "tsundere 傲娇，surprised 惊讶，worried 担心，excited 兴奋。心情要和句子一致："
-    "提到困选 sleepy，提到睡觉或眼罩选 sleeping，提到开心选 happy。";
+    "tsundere 傲娇，surprised 惊讶，worried 担心，excited 兴奋，rice 吃饭。心情要和句子一致："
+    "提到困选 sleepy，提到睡觉或眼罩选 sleeping，提到吃饭或白饭选 rice，提到开心选 happy。";
 
 static const char PET_USER_PROMPT[] =
     "现在的情况：\n"
@@ -49,7 +49,7 @@ static const char PET_USER_PROMPT[] =
     "时段（选一个）：morning 早上5-10点，noon 中午11-13点，afternoon 下午14-16点，evening 傍晚17-19点，"
     "night 晚上20-22点，late-night 深夜23-4点，any 任何时段。\n"
     "天气类别（选一个）：rain 下雨，hot 炎热（30°C以上），cold 寒冷（10°C以下），clear 晴天，weekend 周末，general 通用。\n"
-    "心情（选一个）：neutral，happy，sleepy，sleeping，tsundere，surprised，worried，excited。\n"
+    "心情（选一个）：neutral，happy，sleepy，sleeping，tsundere，surprised，worried，excited，rice。\n"
     "标签必须和句子内容一致：提到下雨就标 rain，提到早上就标 morning，提到困就标 sleepy；没有特指的标 any 或 general，心情标 neutral。\n"
     "分配：大约8句贴合现在（时段 {{bucket}} 或 any，天气类别 {{wclass}} 或 general），"
     "其余分散到接下来一两天会遇到的其他时段和天气；大约三分之一用 any + general，什么时候都能说；"

@@ -1,8 +1,8 @@
 #ifndef COMPANION_MOOD_H
 #define COMPANION_MOOD_H
 
-// Eight expressions. 困 (drowsy) and 打盹 (mask on) stay separate.
-// No hungry / thinking / hot / cold faces: those lines reuse one of these.
+// Nine expressions. 困 (drowsy) and 打盹 (mask on) stay separate.
+// 吃饭 is the rice bowl; meal time and lines about eating use it.
 enum {
     EXPR_NEUTRAL = 0,
     EXPR_HAPPY,
@@ -12,6 +12,7 @@ enum {
     EXPR_SURPRISED,
     EXPR_WORRIED,
     EXPR_EXCITED,
+    EXPR_RICE,
     EXPR_COUNT
 };
 

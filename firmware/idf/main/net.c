@@ -2548,7 +2548,7 @@ void net_compose(UiState *ui)
             face = g_idle_expr;
             reason = g_face_reason[0] ? g_face_reason : "idle";
         } else {
-            int cand[8], n = 0;
+            int cand[16], n = 0;
             int hour = have_time ? local.tm_hour : -1;
             int minute = have_time ? local.tm_min : 0;
             bool late = hour >= 23 || (hour >= 0 && hour < 4);
@@ -2584,8 +2584,8 @@ void net_compose(UiState *ui)
                 reason = "cold";
             }
             if (meal) {
+                cand[n++] = EXPR_RICE;
                 cand[n++] = EXPR_HAPPY;
-                cand[n++] = EXPR_NEUTRAL;
                 reason = "meal";
             }
             if (!n) {
@@ -3019,7 +3019,7 @@ void net_handle_line(char *line)
     } else if (!strncmp(line, "EXPR SHOW ", 10)) {
         int id = mood_parse(line + 10);
         if (id < 0) {
-            printf("usage: EXPR SHOW neutral|happy|sleepy|sleeping|tsundere|surprised|worried|excited\n");
+            printf("usage: EXPR SHOW neutral|happy|sleepy|sleeping|tsundere|surprised|worried|excited|rice\n");
         } else {
             g_cycle = false;
             g_force_expr = id;
