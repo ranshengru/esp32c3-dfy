@@ -191,7 +191,7 @@ static size_t jpeg_read(JDEC *jd, uint8_t *buf, size_t len)
 static int jpeg_write(JDEC *jd, void *bitmap, JRECT *rect)
 {
     JpegClip *clip = jd->device;
-    if (rect->right >= WIDTH || rect->bottom >= HEIGHT)
+    if (rect->right >= jd->width || rect->bottom >= jd->height)
         return 0;
     unsigned w = (unsigned)(rect->right - rect->left + 1);
     const uint16_t *src = bitmap;
@@ -218,8 +218,14 @@ bool assets_blit(int expr, int frame, uint16_t *dest)
     memset(&jd, 0, sizeof(jd));
     if (jd_prepare(&jd, jpeg_read, g_jpeg_pool, sizeof(g_jpeg_pool), &clip) != JDR_OK)
         return false;
-    if (jd.width != WIDTH || jd.height != HEIGHT)
+    // Blank rows above the character are not stored. The frame sits on the
+    // bottom of the 160-tall screen; the top is just white.
+    if (jd.width != WIDTH || jd.height == 0 || jd.height > HEIGHT)
         return false;
+    int y0 = HEIGHT - (int)jd.height;
+    for (int i = 0; i < y0 * WIDTH; ++i)
+        dest[i] = 0xffff;
+    clip.dest = dest + (size_t)y0 * WIDTH;
     return jd_decomp(&jd, jpeg_write, 0) == JDR_OK;
 }
 

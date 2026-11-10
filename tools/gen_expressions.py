@@ -22,7 +22,7 @@ PREVIEW = ROOT / "docs" / "v1.0-expressions-preview.png"
 SHEET = ROOT / "docs" / "v1.0-24frames.png"
 WIDTH, HEIGHT = 128, 160
 SHIFT = 10
-PACK_VERSION = 20261114
+PACK_VERSION = 20261115
 VIDEO_DIR = ROOT / "assets" / "expressions" / "videos"
 FRAME_COUNT = 24
 SRC_FPS = 24
@@ -38,6 +38,31 @@ EXPRS = [
     ("worried", "担心", "worried.mp4"),
     ("excited", "兴奋", "excited.mp4"),
 ]
+
+
+def tight_crop(canvas):
+    """Drop the blank rows above the character. Feet stay on the bottom row,
+    so a shorter frame sits at the bottom of the 160-tall screen.
+    """
+    pixels = canvas.load()
+    top = HEIGHT
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            r, g, b = pixels[x, y]
+            if r < 242 or g < 242 or b < 242:
+                top = y
+                break
+        if top != HEIGHT:
+            break
+    limit = max(0, top - 2)
+    y0 = 0
+    for candidate in (64, 48, 32, 16):
+        if candidate <= limit:
+            y0 = candidate
+            break
+    if y0 == 0:
+        return canvas, HEIGHT
+    return canvas.crop((0, y0, WIDTH, HEIGHT)), HEIGHT - y0
 
 
 def screen_canvas(im):
@@ -185,12 +210,13 @@ def main():
             grab(video, index, full)
             canvas = screen_canvas(Image.open(full))
             full.unlink()
-            jpeg = encode_jpeg(canvas, Path(f"/tmp/enc-{key}-{frame_i}.jpg"))
+            cropped, frame_h = tight_crop(canvas)
+            jpeg = encode_jpeg(cropped, Path(f"/tmp/enc-{key}-{frame_i}.jpg"))
             entries.append((expr_id, frame_i, hold_ms, jpeg))
             if frame_i == 0:
                 previews.append((label, canvas))
             row.append(canvas)
-            print(f"  [{frame_i:02d}] src {index} hold {hold_ms}ms jpeg {len(jpeg)}")
+            print(f"  [{frame_i:02d}] src {index} hold {hold_ms}ms h {frame_h} jpeg {len(jpeg)}")
         strips.append((label, row))
 
     directory = bytearray()
