@@ -1,22 +1,22 @@
-# 联网桌宠 v1.0（ESP-IDF）
+# 联网桌宠 v1.0.1（ESP-IDF）
 
-v1.0 在下面的 v0.5 行为上加了表情，默认仍是经典立绘。
+v1.0.1 在下面的 v0.5 行为上加了表情，并修了 v1.0 把整帧解进 RAM、导致联网和网页容易失败的问题。默认仍是经典立绘。
 
 - 设置页「形象」选经典或表情，串口 `EXPR 0` / `EXPR 1` 一样，存在 NVS，默认经典。`EXPR SHOW <名字>` 强制一张脸 30 秒，`EXPR CYCLE` 轮播，`ASSETS` / `ASSETS SELFTEST` 看表情包。
-- 八个表情循环：平常、开心、困、打盹、傲娇、惊讶、担心、兴奋。打盹才有眼罩。每张脸 4 帧，大约每 0.45 秒换一帧（眨眼、呼吸），人物位置和 v0.1 一样。
-- 每帧是整屏 128×160 RGB565（和内置立绘一样先下移 10 像素再转 180 度）的 zlib 无损压缩，大约 13–16 KB。32 帧一共约 456 KB，放在 `assets` 分区（`0x190000`，2 MB），不进应用镜像。
+- 八个表情循环：平常、开心、困、打盹、傲娇、惊讶、担心、兴奋。打盹才有眼罩。每张脸 4 帧，大约每 0.9 秒换一帧（眨眼、呼吸），人物位置和 v0.1 一样。试过每张脸只留 2 帧，跳跃更明显，所以仍是 4 帧、只放慢。
+- 表情和经典立绘都放在 `assets` 分区（`0x190000`，2 MB），格式 3：按 16 行一条做 LZ4 无损压缩，固件用 `esp_partition_mmap` 从 flash 读压缩字节，只保留约 4 KB 条带缓冲。经典立绘和 v0.5 / v1.0 像素完全一致；表情包缺失或损坏时，用应用里同样压缩的经典图兜底。
 - 没开表情、或表情包缺失时，画面和 v0.5 的内置立绘相同。
 - 空闲时按时间、气温、天气在候选表情里随机一张，保持 60 秒。深夜且 10 分钟没人摸过会打盹；下午或深夜偏困；下雨或 10°C 以下偏担心；30°C 以上偏困；饭点偏开心。挥手的句子、提醒、余额会盖过空闲表情。余额 ≥ 20 开心，5–20 平常，低于 5 担心，查询失败是傲娇。
 - 句子池版本升到 3。生成句多一个心情标签（坏心情改判，不丢句子）。v0.5 的句子池开机迁移，不丢已有的句子。
 - 字库只留简体 GB2312 一级。`assets/extra_chars.txt` 里的繁体人名用字拿掉了，那些字会显示成「?」。
 
-开机串口是 `PET READY v1.0`。分区表变了，要连分区表和表情包一起刷，不要整片擦除（NVS 还在 `0x9000`）：
+开机串口是 `PET READY v1.0.1`。分区布局和 v1.0 相同（NVS 还在 `0x9000`，表情包在 `0x190000`），不要整片擦除。刷应用和表情包（如果还是 v0.5 的分区表，也要刷分区表）：
 
 ```
-python -m esptool --chip esp32c3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m 0x8000 partition-table.bin 0x10000 companion-v1.0.bin 0x190000 assets-v1.0.bin
+python -m esptool --chip esp32c3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 4MB --flash_freq 40m 0x8000 partition-table.bin 0x10000 companion-v1.0.1.bin 0x190000 assets-v1.0.1.bin
 ```
 
-镜像、校验和说明在 `releases/v1.0/`。重做表情包：`python3 tools/gen_expressions.py`（需要当时的表情视频）。
+镜像、校验和说明在 `releases/v1.0.1/`。GitHub 上的 `.bin` 和预览图以 `.b64` 存放，先运行 `python3 tools/decode_b64_assets.py` 再刷。重做表情包：`python3 tools/gen_expressions.py`（从 `assets/expressions/*.png` 和 `idle.rgb565` 打包，不需要原视频）。
 
 下面是 v0.5 起就有的行为。
 
