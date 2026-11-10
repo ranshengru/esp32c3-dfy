@@ -65,8 +65,8 @@ static int g_cache_frame = -1;
 static int g_cache_strip = -1;
 static int g_cache_h;
 
-extern const uint8_t idle_lz4s_start[] asm("_binary_idle_lz4s_start");
-extern const uint8_t idle_lz4s_end[] asm("_binary_idle_lz4s_end");
+extern const uint8_t idle_lz4s_data[];
+extern const unsigned idle_lz4s_size;
 
 static bool header_sane(const AssetHeader *h, const uint8_t *bytes)
 {
@@ -124,11 +124,10 @@ static bool image_ref(int expr, int frame, ImageRef *out)
         return true;
     }
     if (classic_id(expr) < 0) {
-        size_t n = (size_t)(idle_lz4s_end - idle_lz4s_start);
-        if (n < 4)
+        if (idle_lz4s_size < 4)
             return false;
-        out->blob = idle_lz4s_start;
-        out->size = n;
+        out->blob = idle_lz4s_data;
+        out->size = idle_lz4s_size;
         return true;
     }
     return false;
