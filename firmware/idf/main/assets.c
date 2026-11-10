@@ -8,7 +8,7 @@
 #include "esp_partition.h"
 #include "esp_rom_crc.h"
 
-enum { WIDTH = 128, HEIGHT = 160, ENTRY_MAX = 64, FORMAT_VIDEO = 4, JPEG_MAX = 20 * 1024 };
+enum { WIDTH = 128, HEIGHT = 160, ENTRY_MAX = 256, FORMAT_VIDEO = 4, JPEG_MAX = 20 * 1024 };
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -39,7 +39,7 @@ _Static_assert(sizeof(AssetEntry) == 16, "asset entry");
 
 static const char *TAG = "assets";
 static const esp_partition_t *g_part;
-static AssetEntry g_entries[ENTRY_MAX];
+static const AssetEntry *g_entries;
 static int g_count;
 static uint32_t g_version;
 static char g_line[96] = "assets missing";
@@ -115,7 +115,7 @@ void assets_init(void)
         ESP_LOGW(TAG, "%s", g_line);
         return;
     }
-    memcpy(g_entries, g_map + header.header_size, header.entry_count * sizeof(AssetEntry));
+    g_entries = (const AssetEntry *)(g_map + header.header_size);
     int bad = 0;
     for (unsigned i = 0; i < header.entry_count; ++i) {
         const AssetEntry *e = &g_entries[i];

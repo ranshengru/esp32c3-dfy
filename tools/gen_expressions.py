@@ -1,47 +1,43 @@
 #!/usr/bin/env python3
-"""Pack expression clips from the original videos.
+"""Pack eight expression clips, 24 frames each.
 
-Keyframes are picked from each clip, not sampled on a fixed clock. A stretch
-where the picture does not change is not stored. The first frame is the
-representative pose and stays up longer; a blink or a drifting Z is short.
+The screen is already 128x160, so resolution is not a lever. Frames stay
+baseline 4:2:0 JPEG (tjpgd rejects progressive). Quality is ffmpeg -q:v 5:
+q:v 8 and worse blocks the eyes, and a denoise pass does not shrink this art.
+24 frames cover the original clip. A blink peak replaces the nearest even
+sample so a closed eye is not skipped, and the count stays 24.
 """
 
-import io
 import struct
 import subprocess
 import zlib
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "assets" / "expressions"
 BIN_PATH = ROOT / "firmware" / "idf" / "assets.bin"
 PREVIEW = ROOT / "docs" / "v1.0-expressions-preview.png"
+SHEET = ROOT / "docs" / "v1.0-24frames.png"
 WIDTH, HEIGHT = 128, 160
 SHIFT = 10
-RAW = WIDTH * HEIGHT * 2
-PACK_VERSION = 20261113
+PACK_VERSION = 20261114
 VIDEO_DIR = ROOT / "assets" / "expressions" / "videos"
+FRAME_COUNT = 24
+SRC_FPS = 24
+QV = 5
 
-# (name, label, source video, [(frame_index at 8 fps, hold_ms), ...])
-# Picked by watching the original clip. A repeated blink, a return to the same
-# pose, or a whole-body wobble with the same face is not a keyframe.
 EXPRS = [
-    ("neutral", "平常", "neutral.mp4", [(4, 2200), (28, 160)]),
-    ("happy", "开心", "happy.mp4", [(1, 1800), (7, 180)]),
-    ("sleepy", "困", "sleepy.mp4", [(1, 1200), (8, 250), (16, 1400)]),
-    ("sleeping", "打盹", "sleeping.mp4", [(0, 800), (2, 400), (10, 500)]),
-    ("tsundere", "傲娇", "tsundere.mp4", [(4, 2000), (34, 220)]),
-    ("surprised", "惊讶", "surprised.mp4", [(4, 2000), (28, 180)]),
-    ("worried", "担心", "worried.mp4", [(0, 1800), (6, 200)]),
-    ("excited", "兴奋", "excited.mp4", [(12, 1600), (6, 320)]),
+    ("neutral", "平常", "neutral.mp4"),
+    ("happy", "开心", "happy.mp4"),
+    ("sleepy", "困", "sleepy.mp4"),
+    ("sleeping", "打盹", "sleeping.mp4"),
+    ("tsundere", "傲娇", "tsundere.mp4"),
+    ("surprised", "惊讶", "surprised.mp4"),
+    ("worried", "担心", "worried.mp4"),
+    ("excited", "兴奋", "excited.mp4"),
 ]
-
-
-def rgb565(color):
-    r, g, b = color
-    return ((r * 31 + 127) // 255 << 11) | ((g * 63 + 127) // 255 << 5) | ((b * 31 + 127) // 255)
 
 
 def screen_canvas(im):
@@ -51,13 +47,89 @@ def screen_canvas(im):
     return canvas
 
 
-def grab(video, index, dest):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    # 0-based index into an 8 fps sampling of the original clip.
+def crc32(data):
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def is_baseline(data):
+    i = 2
+    while i + 3 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xC0:
+            return True
+        if marker in (0xC1, 0xC2, 0xC3):
+            return False
+        if marker == 0xD8 or marker == 0xD9 or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if marker == 0x00 or marker == 0xFF:
+            i += 1
+            continue
+        seglen = int.from_bytes(data[i + 2 : i + 4], "big")
+        if seglen < 2:
+            return False
+        i += 2 + seglen
+    return False
+
+
+def dump_samples(video, dest):
+    if dest.exists():
+        subprocess.check_call(["rm", "-rf", str(dest)])
+    dest.mkdir(parents=True)
     subprocess.check_call(
         [
             "ffmpeg", "-y", "-i", str(video),
-            "-vf", f"fps=8,select=eq(n\\,{index})",
+            "-vf", f"fps={SRC_FPS},scale=96:-2",
+            "-q:v", "10", str(dest / "f_%03d.jpg"),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return sorted(dest.glob("f_*.jpg"))
+
+
+def mean_diff(a, b):
+    d = ImageChops.difference(a, b)
+    hist = d.histogram()
+    return sum(i * c for i, c in enumerate(hist)) / sum(hist)
+
+
+def pick_indices(frames):
+    grays = [Image.open(p).convert("L") for p in frames]
+    n = len(grays)
+    diffs = [0.0]
+    for i in range(1, n):
+        diffs.append(mean_diff(grays[i], grays[i - 1]))
+    grid = [round(i * (n - 1) / (FRAME_COUNT - 1)) for i in range(FRAME_COUNT)]
+    peaks = [
+        i
+        for i in range(1, n - 1)
+        if diffs[i] >= diffs[i - 1] and diffs[i] >= diffs[i + 1] and diffs[i] >= 6
+    ]
+    peaks.sort(key=lambda i: diffs[i], reverse=True)
+    chosen = set(grid)
+    for peak in peaks[:10]:
+        if peak in chosen:
+            continue
+        nearest = min(chosen, key=lambda g: abs(g - peak))
+        if abs(nearest - peak) <= 4 and diffs[nearest] + 4 < diffs[peak]:
+            chosen.remove(nearest)
+            chosen.add(peak)
+    ordered = sorted(chosen)
+    while len(ordered) > FRAME_COUNT:
+        drop = min(ordered[1:-1], key=lambda i: diffs[i])
+        ordered.remove(drop)
+    return ordered, n
+
+
+def grab(video, index, dest):
+    subprocess.check_call(
+        [
+            "ffmpeg", "-y", "-i", str(video),
+            "-vf", f"select=eq(n\\,{index})",
             "-vsync", "vfr", "-frames:v", "1", str(dest),
         ],
         stdout=subprocess.DEVNULL,
@@ -65,46 +137,61 @@ def grab(video, index, dest):
     )
 
 
-def frame_bytes(canvas):
-    if canvas.size != (WIDTH, HEIGHT):
-        raise SystemExit(f"frame is {canvas.size}, expected {(WIDTH, HEIGHT)}")
-    buf = io.BytesIO()
-    canvas.convert("RGB").save(buf, "JPEG", quality=90, optimize=True, subsampling=2, progressive=False)
-    data = buf.getvalue()
-    if not data.startswith(b"\xff\xd8") or len(data) > 20 * 1024:
+def encode_jpeg(canvas, dest):
+    png = dest.with_suffix(".png")
+    canvas.save(png)
+    subprocess.check_call(
+        [
+            "ffmpeg", "-y", "-i", str(png),
+            "-c:v", "mjpeg", "-q:v", str(QV), "-pix_fmt", "yuvj420p",
+            "-frames:v", "1", str(dest),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    png.unlink()
+    data = dest.read_bytes()
+    dest.unlink()
+    if not data.startswith(b"\xff\xd8") or not is_baseline(data) or len(data) > 20 * 1024:
         raise SystemExit(f"bad jpeg ({len(data)} bytes)")
     return data
 
 
-def crc32(data):
-    return zlib.crc32(data) & 0xFFFFFFFF
-
-
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for old in OUT_DIR.glob("*_[0-9]*.png"):
+        old.unlink()
     entries = []
     previews = []
-    for expr_id, (key, label, video_name, keys) in enumerate(EXPRS):
-        kept = []
-        for frame_i, (index, hold_ms) in enumerate(keys):
-            full = OUT_DIR / f".grab_{key}_{frame_i}.png"
-            grab(VIDEO_DIR / video_name, index, full)
+    strips = []
+    sample_root = Path("/tmp/expr-samples")
+    for expr_id, (key, label, video_name) in enumerate(EXPRS):
+        video = VIDEO_DIR / video_name
+        samples = dump_samples(video, sample_root / key)
+        indices, total = pick_indices(samples)
+        duration = total / SRC_FPS
+        times = [i / SRC_FPS for i in indices]
+        print(f"{key}: {total} src frames -> {indices}")
+        row = []
+        for frame_i, (index, t) in enumerate(zip(indices, times)):
+            if frame_i + 1 < len(times):
+                nxt = times[frame_i + 1]
+            elif frame_i:
+                nxt = t + (t - times[frame_i - 1])
+            else:
+                nxt = t + 1 / SRC_FPS
+            hold_ms = max(40, int(round((nxt - t) * 1000)))
+            full = Path(f"/tmp/grab-{key}-{frame_i}.png")
+            grab(video, index, full)
             canvas = screen_canvas(Image.open(full))
             full.unlink()
-            canvas.save(OUT_DIR / f"{key}_{frame_i}.png")
-            jpeg = frame_bytes(canvas)
-            kept.append((expr_id, frame_i, hold_ms, jpeg))
+            jpeg = encode_jpeg(canvas, Path(f"/tmp/enc-{key}-{frame_i}.jpg"))
+            entries.append((expr_id, frame_i, hold_ms, jpeg))
             if frame_i == 0:
                 previews.append((label, canvas))
-            print(f"{key} frame@{index} hold {hold_ms}ms: jpeg {len(jpeg)}")
-        stale = frame_i
-        while True:
-            stale += 1
-            old = OUT_DIR / f"{key}_{stale}.png"
-            if not old.exists():
-                break
-            old.unlink()
-        entries.extend(kept)
+            row.append(canvas)
+            print(f"  [{frame_i:02d}] src {index} hold {hold_ms}ms jpeg {len(jpeg)}")
+        strips.append((label, row))
 
     directory = bytearray()
     payload = bytearray()
@@ -135,16 +222,19 @@ def main():
     BIN_PATH.write_bytes(blob)
     print(f"wrote {BIN_PATH} {len(blob)} bytes, {len(entries)} frames")
 
-    scale = 3
+    scale = 2
     cols = 4
-    pad = 14
-    label_h = 28
+    pad = 12
+    label_h = 26
     cell_w, cell_h = WIDTH * scale, HEIGHT * scale
-    rows = 2
-    sheet = Image.new("RGB", (cols * cell_w + (cols + 1) * pad, rows * (cell_h + label_h) + (rows + 1) * pad), (243, 234, 220))
+    sheet = Image.new(
+        "RGB",
+        (cols * cell_w + (cols + 1) * pad, 2 * (cell_h + label_h) + 3 * pad),
+        (243, 234, 220),
+    )
     draw = ImageDraw.Draw(sheet)
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 20)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 18)
     except OSError:
         font = ImageFont.load_default()
     for i, (label, canvas) in enumerate(previews):
@@ -156,7 +246,18 @@ def main():
         draw.text((x + (cell_w - tw) / 2, y + cell_h + 4), label, fill=(28, 25, 22), font=font)
     PREVIEW.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(PREVIEW)
-    print(f"wrote {PREVIEW}")
+
+    thumb_w, thumb_h = 64, 80
+    film = Image.new("RGB", (pad + FRAME_COUNT * thumb_w, pad + len(strips) * (thumb_h + 22)), (243, 234, 220))
+    pen = ImageDraw.Draw(film)
+    for r, (label, row) in enumerate(strips):
+        y = pad + r * (thumb_h + 22)
+        pen.text((4, y), label, fill=(40, 32, 28), font=font)
+        for i, canvas in enumerate(row):
+            film.paste(canvas.resize((thumb_w, thumb_h), Image.Resampling.NEAREST), (i * thumb_w, y + 20))
+    film.save(SHEET)
+    film.save("/workspace/artifacts/frames24.png")
+    print(f"wrote {PREVIEW} and {SHEET}")
 
 
 if __name__ == "__main__":
